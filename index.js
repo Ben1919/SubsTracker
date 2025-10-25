@@ -1,13 +1,10 @@
 // 订阅续期通知网站 - 基于CloudFlare Workers (完全优化版)
 
 // 时区处理工具函数
-// 常量：毫秒转换为小时/天，便于全局复用
-const MS_PER_HOUR = 1000 * 60 * 60;
-const MS_PER_DAY = MS_PER_HOUR * 24;
-
 function getCurrentTimeInTimezone(timezone = 'UTC') {
   try {
-    // Workers 环境下 Date 始终存储 UTC 时间，这里直接返回当前时间对象
+    // 直接返回当前时间，时区转换在后续计算中处理
+    // 这样可以避免时区信息丢失的问题
     return new Date();
   } catch (error) {
     console.error(`时区转换错误: ${error.message}`);
@@ -22,53 +19,13 @@ function getTimestampInTimezone(timezone = 'UTC') {
 
 function convertUTCToTimezone(utcTime, timezone = 'UTC') {
   try {
-    // 同 getCurrentTimeInTimezone，一律返回 Date 供后续统一处理
+    // 直接返回原始时间，时区转换在后续计算中处理
+    // 这样可以避免时区信息丢失的问题
     return new Date(utcTime);
   } catch (error) {
     console.error(`时区转换错误: ${error.message}`);
     return new Date(utcTime);
   }
-}
-
-// 获取指定时区的年/月/日/时/分/秒，便于避免重复的 Intl 解析逻辑
-function getTimezoneDateParts(date, timezone = 'UTC') {
-  try {
-    const formatter = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      hour12: false,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit'
-    });
-    const parts = formatter.formatToParts(date);
-    const pick = (type) => {
-      const part = parts.find(item => item.type === type);
-      return part ? Number(part.value) : 0;
-    };
-    return {
-      year: pick('year'),
-      month: pick('month'),
-      day: pick('day'),
-      hour: pick('hour'),
-      minute: pick('minute'),
-      second: pick('second')
-    };
-  } catch (error) {
-    console.error(`解析时区(${timezone})失败: ${error.message}`);
-    return {
-      year: date.getUTCFullYear(),
-      month: date.getUTCMonth() + 1,
-      day: date.getUTCDate(),
-      hour: date.getUTCHours(),
-      minute: date.getUTCMinutes(),
-      second: date.getUTCSeconds()
-    };
-  }
-}
-
-// 计算指定日期在目标时区的午夜时间戳（毫秒），用于统一的“剩余天数”计算
-function getTimezoneMidnightTimestamp(date, timezone = 'UTC') {
-  const { year, month, day } = getTimezoneDateParts(date, timezone);
-  return Date.UTC(year, month - 1, day, 0, 0, 0);
 }
 
 function calculateExpirationTime(expirationMinutes, timezone = 'UTC') {
@@ -118,10 +75,19 @@ function formatTimeInTimezone(time, timezone = 'UTC', format = 'full') {
 
 function getTimezoneOffset(timezone = 'UTC') {
   try {
+    // 使用更准确的时区偏移计算方法
     const now = new Date();
-    const { year, month, day, hour, minute, second } = getTimezoneDateParts(now, timezone);
-    const zonedTimestamp = Date.UTC(year, month - 1, day, hour, minute, second);
-    return Math.round((zonedTimestamp - now.getTime()) / MS_PER_HOUR);
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
+    const parts = dtf.formatToParts(now);
+    const get = type => Number(parts.find(x => x.type === type).value);
+    const target = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+    const utc = now.getTime();
+    return Math.round((target - utc) / (1000 * 60 * 60));
   } catch (error) {
     console.error(`获取时区偏移量错误: ${error.message}`);
     return 0;
@@ -147,6 +113,7 @@ function formatTimezoneDisplay(timezone = 'UTC') {
       'America/Los_Angeles': '美国太平洋时间',
       'America/Chicago': '美国中部时间',
       'America/Denver': '美国山地时间',
+      'America/Los_Angeles': '美国太平洋时间',
       'Europe/London': '英国时间',
       'Europe/Paris': '巴黎时间',
       'Europe/Berlin': '柏林时间',
@@ -492,6 +459,22 @@ const loginPage = `
   </div>
   
   <script>
+    // --- 优化开始：动态获取 Base Path ---
+    // 假设 URL 是 https://tools.aa.com/notice 或 https://tools.aa.com/notice/
+    let adminPrefix = window.location.pathname.replace(/\/$/, '');
+    
+    // 如果路径包含 /admin 或 /api，则认为 Base Path 是它们前面的部分
+    if (adminPrefix.includes('/admin')) {
+        adminPrefix = adminPrefix.substring(0, adminPrefix.indexOf('/admin'));
+    } else if (adminPrefix.includes('/api')) {
+        adminPrefix = adminPrefix.substring(0, adminPrefix.indexOf('/api'));
+    }
+    // 确保 Base Path 不为空，如果为空，则表示 Worker 部署在根路径 /
+    if (!adminPrefix) {
+        adminPrefix = '';
+    }
+    // --- 优化结束 ---
+
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const username = document.getElementById('username').value;
@@ -503,7 +486,8 @@ const loginPage = `
       button.disabled = true;
       
       try {
-        const response = await fetch('/api/login', {
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password })
@@ -512,7 +496,8 @@ const loginPage = `
         const result = await response.json();
         
         if (result.success) {
-          window.location.href = '/admin';
+          // --- 优化：使用动态 Base Path 重定向 ---
+          window.location.href = adminPrefix + '/admin';
         } else {
           document.getElementById('errorMsg').textContent = result.message || '用户名或密码错误';
           button.innerHTML = originalContent;
@@ -855,13 +840,13 @@ const adminPage = `
           <span id="systemTimeDisplay" class="ml-4 text-base text-indigo-600 font-normal"></span>
         </div>
         <div class="flex items-center space-x-4">
-          <a href="/admin" class="text-indigo-600 border-b-2 border-indigo-600 px-3 py-2 rounded-md text-sm font-medium">
+          <a href="/admin" class="nav-link text-indigo-600 border-b-2 border-indigo-600 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-list mr-1"></i>订阅列表
           </a>
-          <a href="/admin/config" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
+          <a href="/admin/config" class="nav-link text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-cog mr-1"></i>系统配置
           </a>
-          <a href="/api/logout" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
+          <a href="/api/logout" class="nav-link text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-sign-out-alt mr-1"></i>退出登录
           </a>
         </div>
@@ -870,34 +855,16 @@ const adminPage = `
   </nav>
   
   <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4 mb-6">
-      <div>
-        <h2 class="text-2xl font-bold text-gray-800">订阅列表</h2>
-        <p class="text-sm text-gray-500 mt-1">使用搜索与分类快速定位订阅，开启农历显示可同步查看农历日期</p>
-      </div>
-      <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 w-full">
-        <div class="flex flex-col sm:flex-row sm:items-center gap-3 w-full lg:flex-1 lg:max-w-2xl">
-          <div class="relative flex-1 min-w-[200px] lg:max-w-md">
-            <input type="text" id="searchKeyword" placeholder="搜索名称、类型或备注..." class="w-full pl-10 pr-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-            <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400">
-              <i class="fas fa-search"></i>
-            </span>
-          </div>
-          <div class="sm:w-44 lg:w-40">
-            <select id="categoryFilter" class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white">
-              <option value="">全部分类</option>
-            </select>
-          </div>
-        </div>
-        <div class="flex items-center space-x-3 lg:space-x-4">
+    <div class="flex justify-between items-center mb-6">
+      <h2 class="text-2xl font-bold text-gray-800">订阅列表</h2>
+      <div class="flex items-center space-x-4">
         <label class="lunar-toggle">
-          <input type="checkbox" id="listShowLunar" class="form-checkbox h-4 w-4 text-indigo-600 shrink-0">
+          <input type="checkbox" id="listShowLunar" class="form-checkbox h-4 w-4 text-indigo-600">
           <span class="text-gray-700">显示农历</span>
         </label>
-        <button id="addSubscriptionBtn" class="btn-primary text-white px-4 py-2 rounded-md text-sm font-medium flex items-center shrink-0">
+        <button id="addSubscriptionBtn" class="btn-primary text-white px-4 py-2 rounded-md text-sm font-medium flex items-center">
           <i class="fas fa-plus mr-2"></i>添加新订阅
         </button>
-      </div>
       </div>
     </div>
     
@@ -933,7 +900,6 @@ const adminPage = `
     </div>
   </div>
 
-  <!-- 添加/编辑订阅的模态框 -->
   <div id="subscriptionModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 modal-container hidden flex items-center justify-center z-50">
     <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-screen overflow-y-auto">
       <div class="bg-gray-50 px-6 py-4 border-b border-gray-200 rounded-t-lg">
@@ -948,26 +914,18 @@ const adminPage = `
       <form id="subscriptionForm" class="p-6 space-y-6">
         <input type="hidden" id="subscriptionId">
         
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div>
             <label for="name" class="block text-sm font-medium text-gray-700 mb-1">订阅名称 *</label>
             <input type="text" id="name" required
               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-            <div class="error-message text-red-500" data-for="reminderValue"></div>
+            <div class="error-message text-red-500"></div>
           </div>
           
           <div>
             <label for="customType" class="block text-sm font-medium text-gray-700 mb-1">订阅类型</label>
             <input type="text" id="customType" placeholder="例如：流媒体、云服务、软件、生日等"
               class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-            <div class="error-message text-red-500"></div>
-          </div>
-
-          <div>
-            <label for="category" class="block text-sm font-medium text-gray-700 mb-1">分类标签</label>
-            <input type="text" id="category" placeholder="例如：个人、家庭、公司"
-              class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-            <p class="mt-1 text-xs text-gray-500">可输入多个标签并使用“/”分隔，便于筛选和统计</p>
             <div class="error-message text-red-500"></div>
           </div>
         </div>
@@ -987,9 +945,9 @@ const adminPage = `
           <div class="md:col-span-2">
             <label for="startDate" class="block text-sm font-medium text-gray-700 mb-1">开始日期</label>
             <div class="relative">
-              <input type="text" id="startDate"
-                class="w-full px-3 py-2 pr-10 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
-                placeholder="YYYY-MM-DD 或点击右侧图标选择">
+              <input type="text" id="startDate" readonly
+                class="w-full px-3 py-2 pr-10 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 cursor-pointer"
+                placeholder="点击选择日期">
               <div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none">
                 <i class="fas fa-calendar text-gray-400"></i>
               </div>
@@ -1008,7 +966,6 @@ const adminPage = `
                     </button>
                   </div>
                   
-                  <!-- 月份选择器 -->
                   <div id="startDateMonthPicker" class="hidden mb-4">
                     <div class="flex justify-between items-center mb-3">
                       <span class="font-medium text-gray-900">选择月份</span>
@@ -1032,7 +989,6 @@ const adminPage = `
                     </div>
                   </div>
                   
-                  <!-- 年份选择器 -->
                   <div id="startDateYearPicker" class="hidden mb-4">
                     <div class="flex justify-between items-center mb-3">
                       <span class="font-medium text-gray-900">选择年份</span>
@@ -1050,8 +1006,7 @@ const adminPage = `
                       </button>
                     </div>
                     <div id="startDateYearGrid" class="grid grid-cols-3 gap-2">
-                      <!-- 年份按钮将通过JavaScript动态生成 -->
-                    </div>
+                      </div>
                   </div>
                   
                   <div class="grid grid-cols-7 gap-2 mb-3">
@@ -1065,7 +1020,6 @@ const adminPage = `
                   </div>
                   <div id="startDateCalendar" class="grid grid-cols-7 gap-2"></div>
                   
-                  <!-- 回到今天按钮 -->
                   <div class="mt-4 pt-3 border-t border-gray-200">
                     <button type="button" id="startDateGoToToday" class="w-full px-3 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-md">
                       <i class="fas fa-calendar-day mr-2"></i>回到今天
@@ -1100,9 +1054,9 @@ const adminPage = `
           <div>
             <label for="expiryDate" class="block text-sm font-medium text-gray-700 mb-1">到期日期 *</label>
             <div class="relative">
-              <input type="text" id="expiryDate" required
-                class="w-full px-3 py-2 pr-10 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500"
-                placeholder="YYYY-MM-DD 或点击右侧图标选择">
+              <input type="text" id="expiryDate" readonly required
+                class="readonly-input w-full px-3 py-2 pr-10 border border-gray-300 rounded-md focus:outline-none cursor-pointer"
+                placeholder="点击选择日期">
               <div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none">
                 <i class="fas fa-calendar text-gray-400"></i>
               </div>
@@ -1121,7 +1075,6 @@ const adminPage = `
                   </button>
                 </div>
                 
-                <!-- 月份选择器 -->
                 <div id="expiryDateMonthPicker" class="hidden mb-4">
                   <div class="flex justify-between items-center mb-3">
                     <span class="font-medium text-gray-900">选择月份</span>
@@ -1145,7 +1098,6 @@ const adminPage = `
                   </div>
                 </div>
                 
-                <!-- 年份选择器 -->
                 <div id="expiryDateYearPicker" class="hidden mb-4">
                   <div class="flex justify-between items-center mb-3">
                     <span class="font-medium text-gray-900">选择年份</span>
@@ -1163,8 +1115,7 @@ const adminPage = `
                     </button>
                   </div>
                   <div id="expiryDateYearGrid" class="grid grid-cols-3 gap-2">
-                    <!-- 年份按钮将通过JavaScript动态生成 -->
-                  </div>
+                    </div>
                 </div>
                 
                 <div class="grid grid-cols-7 gap-2 mb-3">
@@ -1178,7 +1129,6 @@ const adminPage = `
                 </div>
                 <div id="expiryDateCalendar" class="grid grid-cols-7 gap-2"></div>
                 
-                <!-- 回到今天按钮 -->
                 <div class="mt-4 pt-3 border-t border-gray-200">
                   <button type="button" id="expiryDateGoToToday" class="w-full px-3 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-md">
                     <i class="fas fa-calendar-day mr-2"></i>回到今天
@@ -1199,17 +1149,10 @@ const adminPage = `
         
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div>
-            <label for="reminderValue" class="block text-sm font-medium text-gray-700 mb-1">提醒提前量</label>
-            <div class="flex space-x-3">
-              <input type="number" id="reminderValue" min="0" value="7"
-                class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
-              <select id="reminderUnit"
-                class="w-32 px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white">
-                <option value="day" selected>天</option>
-                <option value="hour">小时</option>
-              </select>
-            </div>
-            <p class="text-xs text-gray-500 mt-1">0 = 仅在到期时提醒；选择“小时”需要将 Worker 定时任务调整为小时级执行</p>
+            <label for="reminderDays" class="block text-sm font-medium text-gray-700 mb-1">提前提醒天数</label>
+            <input type="number" id="reminderDays" min="0" value="7"
+              class="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-indigo-500 focus:border-indigo-500">
+            <p class="text-xs text-gray-500 mt-1">0 = 仅到期日当天提醒，1+ = 提前N天开始提醒</p>
             <div class="error-message text-red-500"></div>
           </div>
           
@@ -1252,6 +1195,32 @@ const adminPage = `
   </div>
 
   <script>
+    // --- 优化开始：动态确定 Admin Base Path ---
+    // 确定 Base Path，例如 /notice
+    let adminPrefix = window.location.pathname.replace('/admin', '').replace('/config', '').replace(/\/$/, '');
+    if (!adminPrefix) {
+        adminPrefix = '';
+    }
+    
+    // 全局修正所有以 /admin 或 /api 开头的链接
+    function updateLinks() {
+        document.querySelectorAll('a[href]').forEach(link => {
+            let originalHref = link.getAttribute('href');
+            if (originalHref) {
+                if (originalHref.startsWith('/admin') || originalHref.startsWith('/api')) {
+                    // 如果链接还没有 Base Path，则添加
+                    if (!originalHref.startsWith(adminPrefix + '/admin') && !originalHref.startsWith(adminPrefix + '/api')) {
+                       link.setAttribute('href', adminPrefix + originalHref);
+                    }
+                }
+            }
+        });
+    }
+
+    // 在页面加载后调用链接修正函数
+    window.addEventListener('load', updateLinks);
+    // --- 优化结束 ---
+
     // 兼容性函数 - 保持原有接口
     function formatBeijingTime(date = new Date(), format = 'full') {
       try {
@@ -1567,7 +1536,7 @@ const lunarBiz = {
       // 保存用户偏好
       localStorage.setItem('showLunar', listShowLunar.checked);
       // 重新加载订阅列表以应用农历显示设置
-      renderSubscriptionTable();
+      loadSubscriptions();
     }
 
     function showToast(message, type = 'success', duration = 3000) {
@@ -1595,10 +1564,7 @@ const lunarBiz = {
 
     function showFieldError(fieldId, message) {
       const field = document.getElementById(fieldId);
-      let errorDiv = field.parentElement ? field.parentElement.querySelector('.error-message') : null;
-      if (!errorDiv) {
-        errorDiv = document.querySelector('.error-message[data-for="' + fieldId + '"]');
-      }
+      const errorDiv = field.parentElement.querySelector('.error-message');
       if (errorDiv) {
         errorDiv.textContent = message;
         errorDiv.classList.add('show');
@@ -1638,10 +1604,9 @@ const lunarBiz = {
         isValid = false;
       }
 
-      const reminderValueField = document.getElementById('reminderValue');
-      const reminderValue = reminderValueField.value;
-      if (reminderValue === '' || Number(reminderValue) < 0) {
-        showFieldError('reminderValue', '提醒值不能为负数');
+      const reminderDays = document.getElementById('reminderDays').value;
+      if (reminderDays === '' || reminderDays < 0) {
+        showFieldError('reminderDays', '提醒天数不能为负数');
         isValid = false;
       }
 
@@ -1663,432 +1628,305 @@ const lunarBiz = {
       '</div>';
     }
 
-    const categorySeparator = /[\/,，\s]+/;
-    let subscriptionsCache = [];
-    let searchDebounceTimer = null;
-
-    function normalizeCategoryTokens(category = '') {
-      return category
-        .split(categorySeparator)
-        .map(token => token.trim())
-        .filter(token => token.length > 0);
-    }
-
-    function populateCategoryFilter(subscriptions) {
-      const select = document.getElementById('categoryFilter');
-      if (!select) {
-        return;
-      }
-
-      const previousValue = select.value;
-      const categories = new Set();
-
-      (subscriptions || []).forEach(subscription => {
-        normalizeCategoryTokens(subscription.category).forEach(token => categories.add(token));
-      });
-
-      const sorted = Array.from(categories).sort((a, b) => a.localeCompare(b, 'zh-CN'));
-      select.innerHTML = '';
-
-      const defaultOption = document.createElement('option');
-      defaultOption.value = '';
-      defaultOption.textContent = '全部分类';
-      select.appendChild(defaultOption);
-
-      sorted.forEach(cat => {
-        const option = document.createElement('option');
-        option.value = cat;
-        option.textContent = cat;
-        select.appendChild(option);
-      });
-
-      if (previousValue && sorted.map(item => item.toLowerCase()).includes(previousValue.toLowerCase())) {
-        select.value = previousValue;
-      } else {
-        select.value = '';
-      }
-    }
-
-    function getReminderSettings(subscription) {
-      const fallbackDays = subscription.reminderDays !== undefined ? subscription.reminderDays : 7;
-      let unit = subscription.reminderUnit || '';
-      let value = subscription.reminderValue;
-
-      if (unit !== 'hour') {
-        unit = 'day';
-      }
-
-      if (unit === 'hour' && (value === undefined || value === null || isNaN(value))) {
-        value = subscription.reminderHours !== undefined ? subscription.reminderHours : 0;
-      }
-
-      if (value === undefined || value === null || isNaN(value)) {
-        value = fallbackDays;
-      }
-
-      value = Number(value);
-
-      return {
-        unit,
-        value,
-        displayText: unit === 'hour' ? '提前' + value + '小时' : '提前' + value + '天'
-      };
-    }
-
-    function attachHoverListeners() {
-      function positionTooltip(element, tooltip) {
-        const rect = element.getBoundingClientRect();
-        const tooltipHeight = 100;
-        const viewportHeight = window.innerHeight;
-        const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
-
-        let top = rect.bottom + scrollTop + 8;
-        let left = rect.left;
-
-        if (rect.bottom + tooltipHeight > viewportHeight) {
-          top = rect.top + scrollTop - tooltipHeight - 8;
-          tooltip.style.transform = 'translateY(10px)';
-          tooltip.classList.add('tooltip-above');
-        } else {
-          tooltip.style.transform = 'translateY(-10px)';
-          tooltip.classList.remove('tooltip-above');
-        }
-
-        const maxLeft = window.innerWidth - 320 - 20;
-        if (left > maxLeft) {
-          left = maxLeft;
-        }
-
-        tooltip.style.left = left + 'px';
-        tooltip.style.top = top + 'px';
-      }
-
-      document.querySelectorAll('.notes-text').forEach(notesElement => {
-        const fullNotes = notesElement.getAttribute('data-full-notes');
-        const tooltip = notesElement.parentElement.querySelector('.notes-tooltip');
-
-        if (fullNotes && tooltip) {
-          notesElement.addEventListener('mouseenter', () => {
-            tooltip.textContent = fullNotes;
-            positionTooltip(notesElement, tooltip);
-            tooltip.classList.add('show');
-          });
-
-          notesElement.addEventListener('mouseleave', () => {
-            tooltip.classList.remove('show');
-          });
-
-          window.addEventListener('scroll', () => {
-            if (tooltip.classList.contains('show')) {
-              tooltip.classList.remove('show');
-            }
-          }, { passive: true });
-        }
-      });
-
-      document.querySelectorAll('.hover-text').forEach(hoverElement => {
-        const fullText = hoverElement.getAttribute('data-full-text');
-        const tooltip = hoverElement.parentElement.querySelector('.hover-tooltip');
-
-        if (fullText && tooltip) {
-          hoverElement.addEventListener('mouseenter', () => {
-            tooltip.textContent = fullText;
-            positionTooltip(hoverElement, tooltip);
-            tooltip.classList.add('show');
-          });
-
-          hoverElement.addEventListener('mouseleave', () => {
-            tooltip.classList.remove('show');
-          });
-
-          window.addEventListener('scroll', () => {
-            if (tooltip.classList.contains('show')) {
-              tooltip.classList.remove('show');
-            }
-          }, { passive: true });
-        }
-      });
-    }
-
-    function renderSubscriptionTable() {
-      const tbody = document.getElementById('subscriptionsBody');
-      if (!tbody) {
-        return;
-      }
-
-      const listShowLunar = document.getElementById('listShowLunar');
-      const showLunar = listShowLunar ? listShowLunar.checked : false;
-      const searchInput = document.getElementById('searchKeyword');
-      const keyword = searchInput ? searchInput.value.trim().toLowerCase() : '';
-      const categorySelect = document.getElementById('categoryFilter');
-      const selectedCategory = categorySelect ? categorySelect.value.trim().toLowerCase() : '';
-
-      let filtered = Array.isArray(subscriptionsCache) ? [...subscriptionsCache] : [];
-
-      if (selectedCategory) {
-        filtered = filtered.filter(subscription =>
-          normalizeCategoryTokens(subscription.category).some(token => token.toLowerCase() === selectedCategory)
-        );
-      }
-
-      if (keyword) {
-        filtered = filtered.filter(subscription => {
-          const haystack = [
-            subscription.name,
-            subscription.customType,
-            subscription.notes,
-            subscription.category
-          ].filter(Boolean).join(' ').toLowerCase();
-          return haystack.includes(keyword);
-        });
-      }
-
-      if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-gray-500">没有符合条件的订阅</td></tr>';
-        return;
-      }
-
-      filtered.sort((a, b) => new Date(a.expiryDate) - new Date(b.expiryDate));
-      tbody.innerHTML = '';
-
-      const currentTime = new Date();
-
-      filtered.forEach(subscription => {
-        const row = document.createElement('tr');
-        row.className = subscription.isActive === false ? 'hover:bg-gray-50 bg-gray-100' : 'hover:bg-gray-50';
-
-        const calendarTypeHtml = subscription.useLunar
-          ? '<div class="text-xs text-purple-600 mt-1">日历类型：农历</div>'
-          : '<div class="text-xs text-gray-600 mt-1">日历类型：公历</div>';
-
-        const expiryDate = new Date(subscription.expiryDate);
-        const currentDtf = new Intl.DateTimeFormat('en-US', {
-          timeZone: globalTimezone,
-          hour12: false,
-          year: 'numeric', month: '2-digit', day: '2-digit'
-        });
-        const currentParts = currentDtf.formatToParts(currentTime);
-        const getCurrent = type => Number(currentParts.find(x => x.type === type).value);
-        const currentDateInTimezone = Date.UTC(getCurrent('year'), getCurrent('month') - 1, getCurrent('day'), 0, 0, 0);
-
-        const expiryDtf = new Intl.DateTimeFormat('en-US', {
-          timeZone: globalTimezone,
-          hour12: false,
-          year: 'numeric', month: '2-digit', day: '2-digit'
-        });
-        const expiryParts = expiryDtf.formatToParts(expiryDate);
-        const getExpiry = type => Number(expiryParts.find(x => x.type === type).value);
-        const expiryDateInTimezone = Date.UTC(getExpiry('year'), getExpiry('month') - 1, getExpiry('day'), 0, 0, 0);
-
-        const daysDiff = Math.round((expiryDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
-        const diffMs = expiryDate.getTime() - currentTime.getTime();
-        const diffHours = diffMs / (1000 * 60 * 60);
-
-        const reminder = getReminderSettings(subscription);
-        const isSoon = reminder.unit === 'hour'
-          ? diffHours >= 0 && diffHours <= reminder.value
-          : daysDiff >= 0 && daysDiff <= reminder.value;
-
-        let statusHtml = '';
-        if (!subscription.isActive) {
-          statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-gray-500"><i class="fas fa-pause-circle mr-1"></i>已停用</span>';
-        } else if (daysDiff < 0) {
-          statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-red-500"><i class="fas fa-exclamation-circle mr-1"></i>已过期</span>';
-        } else if (isSoon) {
-          statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-yellow-500"><i class="fas fa-exclamation-triangle mr-1"></i>即将到期</span>';
-        } else {
-          statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-green-500"><i class="fas fa-check-circle mr-1"></i>正常</span>';
-        }
-
-        let periodText = '';
-        if (subscription.periodValue && subscription.periodUnit) {
-          const unitMap = { day: '天', month: '月', year: '年' };
-          periodText = subscription.periodValue + ' ' + (unitMap[subscription.periodUnit] || subscription.periodUnit);
-        }
-
-        const autoRenewIcon = subscription.autoRenew !== false
-          ? '<i class="fas fa-sync-alt text-blue-500 ml-1" title="自动续订"></i>'
-          : '<i class="fas fa-ban text-gray-400 ml-1" title="不自动续订"></i>';
-
-        let lunarExpiryText = '';
-        let startLunarText = '';
-        if (showLunar) {
-          const expiryDateObj = new Date(subscription.expiryDate);
-          const lunarExpiry = lunarCalendar.solar2lunar(expiryDateObj.getFullYear(), expiryDateObj.getMonth() + 1, expiryDateObj.getDate());
-          lunarExpiryText = lunarExpiry ? lunarExpiry.fullStr : '';
-
-          if (subscription.startDate) {
-            const startDateObj = new Date(subscription.startDate);
-            const lunarStart = lunarCalendar.solar2lunar(startDateObj.getFullYear(), startDateObj.getMonth() + 1, startDateObj.getDate());
-            startLunarText = lunarStart ? lunarStart.fullStr : '';
-          }
-        }
-
-        let notesHtml = '';
-        if (subscription.notes) {
-          const notes = subscription.notes;
-          if (notes.length > 50) {
-            const truncatedNotes = notes.substring(0, 50) + '...';
-            notesHtml = '<div class="notes-container">' +
-              '<div class="notes-text text-xs text-gray-500" data-full-notes="' + notes.replace(/"/g, '&quot;') + '">' +
-                truncatedNotes +
-              '</div>' +
-              '<div class="notes-tooltip"></div>' +
-            '</div>';
-          } else {
-            notesHtml = '<div class="text-xs text-gray-500">' + notes + '</div>';
-          }
-        }
-
-        const nameHtml = createHoverText(subscription.name, 20, 'text-sm font-medium text-gray-900');
-        const typeHtml = createHoverText(subscription.customType || '其他', 15, 'text-sm text-gray-900');
-        const periodHtml = periodText ? createHoverText('周期: ' + periodText, 20, 'text-xs text-gray-500 mt-1') : '';
-
-        const categoryTokens = normalizeCategoryTokens(subscription.category);
-        const categoryHtml = categoryTokens.length
-          ? '<div class="flex flex-wrap gap-2 mt-2">' + categoryTokens.map(cat =>
-              '<span class="px-2 py-0.5 bg-indigo-50 text-indigo-600 text-xs rounded-full"><i class="fas fa-tag mr-1"></i>' + cat + '</span>'
-            ).join('') + '</div>'
-          : '';
-
-        function formatDateInTimezone(date, timezone) {
-          return date.toLocaleDateString('zh-CN', {
-            timeZone: timezone,
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit'
-          });
-        }
-
-        const expiryDateText = formatDateInTimezone(new Date(subscription.expiryDate), globalTimezone);
-        const lunarHtml = lunarExpiryText ? createHoverText('农历: ' + lunarExpiryText, 25, 'text-xs text-blue-600 mt-1') : '';
-
-        let daysLeftText = '';
-        if (diffMs < 0) {
-          const absDays = Math.abs(daysDiff);
-          if (absDays >= 1) {
-            daysLeftText = '已过期' + absDays + '天';
-          } else {
-            const absHours = Math.ceil(Math.abs(diffHours));
-            daysLeftText = '已过期' + absHours + '小时';
-          }
-        } else if (daysDiff >= 1) {
-          daysLeftText = '还剩' + daysDiff + '天';
-        } else {
-          const hoursLeft = Math.max(0, Math.ceil(diffHours));
-          daysLeftText = hoursLeft > 0 ? '约 ' + hoursLeft + ' 小时后到期' : '即将到期';
-        }
-
-        const startDateText = subscription.startDate
-          ? '开始: ' + formatDateInTimezone(new Date(subscription.startDate), globalTimezone) + (startLunarText ? ' (' + startLunarText + ')' : '')
-          : '';
-        const startDateHtml = startDateText ? createHoverText(startDateText, 30, 'text-xs text-gray-500 mt-1') : '';
-
-        const reminderExtra = reminder.value === 0
-          ? '<div class="text-xs text-gray-500 mt-1">仅到期时提醒</div>'
-          : (reminder.unit === 'hour' ? '<div class="text-xs text-gray-500 mt-1">小时级提醒</div>' : '');
-        const reminderHtml = '<div><i class="fas fa-bell mr-1"></i>' + reminder.displayText + '</div>' + reminderExtra;
-
-        row.innerHTML =
-          '<td data-label="名称" class="px-4 py-3"><div class="td-content-wrapper">' +
-            nameHtml +
-            notesHtml +
-          '</div></td>' +
-          '<td data-label="类型" class="px-4 py-3"><div class="td-content-wrapper space-y-1">' +
-            '<div class="flex items-center gap-1">' +
-              '<i class="fas fa-layer-group text-gray-400"></i>' +
-              typeHtml +
-            '</div>' +
-            (periodHtml ? '<div class="flex items-center gap-1">' + periodHtml + autoRenewIcon + '</div>' : '') +
-            categoryHtml +
-            calendarTypeHtml +
-          '</div></td>' +
-          '<td data-label="到期时间" class="px-4 py-3"><div class="td-content-wrapper">' +
-            '<div class="text-sm text-gray-900">' + expiryDateText + '</div>' +
-            lunarHtml +
-            '<div class="text-xs text-gray-500 mt-1">' + daysLeftText + '</div>' +
-            startDateHtml +
-          '</div></td>' +
-          '<td data-label="提醒设置" class="px-4 py-3"><div class="td-content-wrapper">' +
-            reminderHtml +
-          '</div></td>' +
-          '<td data-label="状态" class="px-4 py-3"><div class="td-content-wrapper">' + statusHtml + '</div></td>' +
-          '<td data-label="操作" class="px-4 py-3">' +
-            '<div class="action-buttons-wrapper">' +
-              '<button class="edit btn-primary text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-edit mr-1"></i>编辑</button>' +
-              '<button class="test-notify btn-info text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-paper-plane mr-1"></i>测试</button>' +
-              '<button class="delete btn-danger text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-trash-alt mr-1"></i>删除</button>' +
-              (subscription.isActive
-                ? '<button class="toggle-status btn-warning text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '" data-action="deactivate"><i class="fas fa-pause-circle mr-1"></i>停用</button>'
-                : '<button class="toggle-status btn-success text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '" data-action="activate"><i class="fas fa-play-circle mr-1"></i>启用</button>') +
-            '</div>' +
-          '</td>';
-
-        tbody.appendChild(row);
-      });
-
-      document.querySelectorAll('.edit').forEach(button => {
-        button.addEventListener('click', editSubscription);
-      });
-
-      document.querySelectorAll('.delete').forEach(button => {
-        button.addEventListener('click', deleteSubscription);
-      });
-
-      document.querySelectorAll('.toggle-status').forEach(button => {
-        button.addEventListener('click', toggleSubscriptionStatus);
-      });
-
-      document.querySelectorAll('.test-notify').forEach(button => {
-        button.addEventListener('click', testSubscriptionNotification);
-      });
-
-      attachHoverListeners();
-    }
-
-    const searchInput = document.getElementById('searchKeyword');
-    if (searchInput) {
-      searchInput.addEventListener('input', () => {
-        clearTimeout(searchDebounceTimer);
-        searchDebounceTimer = setTimeout(() => renderSubscriptionTable(), 200);
-      });
-    }
-
-    const categorySelect = document.getElementById('categoryFilter');
-    if (categorySelect) {
-      categorySelect.addEventListener('change', () => renderSubscriptionTable());
-    }
-
     // 获取所有订阅并按到期时间排序
-    async function loadSubscriptions(showLoading = true) {
+    async function loadSubscriptions() {
       try {
+        // 加载农历显示偏好
         const listShowLunar = document.getElementById('listShowLunar');
         const saved = localStorage.getItem('showLunar');
         if (listShowLunar) {
           if (saved !== null) {
             listShowLunar.checked = saved === 'true';
           } else {
-            listShowLunar.checked = true;
+            listShowLunar.checked = true; // 默认显示
           }
         }
 
         const tbody = document.getElementById('subscriptionsBody');
-        if (tbody && showLoading) {
-          tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4"><i class="fas fa-spinner fa-spin mr-2"></i>加载中...</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4"><i class="fas fa-spinner fa-spin mr-2"></i>加载中...</td></tr>';
+
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/subscriptions');
+        const data = await response.json();
+        // --- 优化结束 ---
+        
+        tbody.innerHTML = '';
+        
+        if (data.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-gray-500">没有订阅数据</td></tr>';
+          return;
+        }
+        
+        // 按到期时间升序排序（最早到期的在前）
+        data.sort((a, b) => new Date(a.expiryDate) - new Date(b.expiryDate));
+        
+		//新增修改，添加日历类型
+        data.forEach(subscription => {
+          const row = document.createElement('tr');
+          row.className = subscription.isActive === false ? 'hover:bg-gray-50 bg-gray-100' : 'hover:bg-gray-50';
+          
+		  // 新增修改：日历类型显示
+		  let calendarTypeHtml = '';
+		  if (subscription.useLunar) {
+			calendarTypeHtml = '<div class="text-xs text-purple-600 mt-1">日历类型：农历</div>';
+		  } else {
+			calendarTypeHtml = '<div class="text-xs text-gray-600 mt-1">日历类型：公历</div>';
+		  }
+		  
+          const expiryDate = new Date(subscription.expiryDate);
+          // 使用配置的时区计算天数差，确保时区变化时天数计算正确
+          const currentTime = new Date();
+          
+          // 获取当前时间在配置时区的日期部分（午夜时间）
+          const currentDtf = new Intl.DateTimeFormat('en-US', {
+            timeZone: globalTimezone,
+            hour12: false,
+            year: 'numeric', month: '2-digit', day: '2-digit'
+          });
+          const currentParts = currentDtf.formatToParts(currentTime);
+          const getCurrent = type => Number(currentParts.find(x => x.type === type).value);
+          const currentDateInTimezone = Date.UTC(getCurrent('year'), getCurrent('month') - 1, getCurrent('day'), 0, 0, 0);
+          
+          // 获取到期时间在配置时区的日期部分（午夜时间）
+          const expiryDtf = new Intl.DateTimeFormat('en-US', {
+            timeZone: globalTimezone,
+            hour12: false,
+            year: 'numeric', month: '2-digit', day: '2-digit'
+          });
+          const expiryParts = expiryDtf.formatToParts(expiryDate);
+          const getExpiry = type => Number(expiryParts.find(x => x.type === type).value);
+          const expiryDateInTimezone = Date.UTC(getExpiry('year'), getExpiry('month') - 1, getExpiry('day'), 0, 0, 0);
+          
+          // 计算天数差（基于时区日期的午夜时间）
+          const daysDiff = Math.round((expiryDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
+          
+          let statusHtml = '';
+          if (!subscription.isActive) {
+            statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-gray-500"><i class="fas fa-pause-circle mr-1"></i>已停用</span>';
+          } else if (daysDiff < 0) {
+            statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-red-500"><i class="fas fa-exclamation-circle mr-1"></i>已过期</span>';
+          } else if (daysDiff <= (subscription.reminderDays || 7)) {
+            statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-yellow-500"><i class="fas fa-exclamation-triangle mr-1"></i>即将到期</span>';
+          } else {
+            statusHtml = '<span class="px-2 py-1 text-xs font-medium rounded-full text-white bg-green-500"><i class="fas fa-check-circle mr-1"></i>正常</span>';
+          }
+          
+          let periodText = '';
+          if (subscription.periodValue && subscription.periodUnit) {
+            const unitMap = { day: '天', month: '月', year: '年' };
+            periodText = subscription.periodValue + ' ' + (unitMap[subscription.periodUnit] || subscription.periodUnit);
+          }
+          
+          const autoRenewIcon = subscription.autoRenew !== false ? 
+            '<i class="fas fa-sync-alt text-blue-500 ml-1" title="自动续订"></i>' : 
+            '<i class="fas fa-ban text-gray-400 ml-1" title="不自动续订"></i>';
+          
+          // 检查是否显示农历
+          const showLunar = listShowLunar ? listShowLunar.checked : false;
+          let lunarExpiryText = '';
+          let startLunarText = '';
+
+          if (showLunar) {
+            // 计算农历日期
+            const expiryDateObj = new Date(subscription.expiryDate);
+            const lunarExpiry = lunarCalendar.solar2lunar(expiryDateObj.getFullYear(), expiryDateObj.getMonth() + 1, expiryDateObj.getDate());
+            lunarExpiryText = lunarExpiry ? lunarExpiry.fullStr : '';
+
+            if (subscription.startDate) {
+              const startDateObj = new Date(subscription.startDate);
+              const lunarStart = lunarCalendar.solar2lunar(startDateObj.getFullYear(), startDateObj.getMonth() + 1, startDateObj.getDate());
+              startLunarText = lunarStart ? lunarStart.fullStr : '';
+            }
+          }
+
+          // 处理备注显示
+          let notesHtml = '';
+          if (subscription.notes) {
+            const notes = subscription.notes;
+            if (notes.length > 50) {
+              const truncatedNotes = notes.substring(0, 50) + '...';
+              notesHtml = '<div class="notes-container">' +
+                '<div class="notes-text text-xs text-gray-500" data-full-notes="' + notes.replace(/"/g, '&quot;') + '">' +
+                  truncatedNotes +
+                '</div>' +
+                '<div class="notes-tooltip"></div>' +
+              '</div>';
+            } else {
+              notesHtml = '<div class="text-xs text-gray-500">' + notes + '</div>';
+            }
+          }
+
+		  // 生成各列内容
+		  const nameHtml = createHoverText(subscription.name, 20, 'text-sm font-medium text-gray-900');
+		  const typeHtml = createHoverText((subscription.customType || '其他'), 15, 'text-sm text-gray-900');
+		  const periodHtml = periodText ? createHoverText('周期: ' + periodText, 20, 'text-xs text-gray-500 mt-1') : '';
+
+          // 到期时间相关信息 - 使用全局时区
+          function formatDateInTimezone(date, timezone) {
+            return date.toLocaleDateString('zh-CN', { 
+              timeZone: timezone, 
+              year: 'numeric', 
+              month: '2-digit', 
+              day: '2-digit' 
+            });
+          }
+          
+          const expiryDateText = formatDateInTimezone(new Date(subscription.expiryDate), globalTimezone);
+          const lunarHtml = lunarExpiryText ? createHoverText('农历: ' + lunarExpiryText, 25, 'text-xs text-blue-600 mt-1') : '';
+          const daysLeftText = daysDiff < 0 ? '已过期' + Math.abs(daysDiff) + '天' : '还剩' + daysDiff + '天';
+          const startDateText = subscription.startDate ?
+            '开始: ' + formatDateInTimezone(new Date(subscription.startDate), globalTimezone) + (startLunarText ? ' (' + startLunarText + ')' : '') : '';
+          const startDateHtml = startDateText ? createHoverText(startDateText, 30, 'text-xs text-gray-500 mt-1') : '';
+
+		  //新增修改，修改日历类型
+		  row.innerHTML =
+			'<td data-label="名称" class="px-4 py-3"><div class="td-content-wrapper">' +
+			  nameHtml +
+			  notesHtml +
+			'</div></td>' +
+			'<td data-label="类型" class="px-4 py-3"><div class="td-content-wrapper">' +
+			  '<div class="flex items-center"><i class="fas fa-tag mr-1"></i><span>' + typeHtml + '</span></div>' +
+			  (periodHtml ? '<div class="flex items-center">' + periodHtml + autoRenewIcon + '</div>' : '') +
+			  calendarTypeHtml + // 新增：日历类型
+			'</div></td>' +
+			// ...existing code...
+			'<td data-label="到期时间" class="px-4 py-3"><div class="td-content-wrapper">' +
+			  '<div class="text-sm text-gray-900">' + expiryDateText + '</div>' +
+			  lunarHtml +
+			  '<div class="text-xs text-gray-500 mt-1">' + daysLeftText + '</div>' +
+			  startDateHtml +
+			'</div></td>' +
+			// ...existing code...
+			'<td data-label="提醒设置" class="px-4 py-3"><div class="td-content-wrapper">' +
+			  '<div><i class="fas fa-bell mr-1"></i>提前' + (subscription.reminderDays || 0) + '天</div>' +
+			  (subscription.reminderDays === 0 ? '<div class="text-xs text-gray-500 mt-1">仅到期日提醒</div>' : '') +
+			'</div></td>' +
+			'<td data-label="状态" class="px-4 py-3"><div class="td-content-wrapper">' + statusHtml + '</div></td>' +
+			'<td data-label="操作" class="px-4 py-3">' +
+			  '<div class="action-buttons-wrapper">' +
+				'<button class="edit btn-primary text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-edit mr-1"></i>编辑</button>' +
+				'<button class="test-notify btn-info text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-paper-plane mr-1"></i>测试</button>' +
+				'<button class="delete btn-danger text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '"><i class="fas fa-trash-alt mr-1"></i>删除</button>' +
+				(subscription.isActive ?
+				  '<button class="toggle-status btn-warning text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '" data-action="deactivate"><i class="fas fa-pause-circle mr-1"></i>停用</button>' :
+				  '<button class="toggle-status btn-success text-white px-2 py-1 rounded text-xs whitespace-nowrap" data-id="' + subscription.id + '" data-action="activate"><i class="fas fa-play-circle mr-1"></i>启用</button>') +
+			  '</div>' +
+			'</td>';
+
+		  tbody.appendChild(row);
+        });
+        
+        document.querySelectorAll('.edit').forEach(button => {
+          button.addEventListener('click', editSubscription);
+        });
+        
+        document.querySelectorAll('.delete').forEach(button => {
+          button.addEventListener('click', deleteSubscription);
+        });
+        
+        document.querySelectorAll('.toggle-status').forEach(button => {
+          button.addEventListener('click', toggleSubscriptionStatus);
+        });
+
+        document.querySelectorAll('.test-notify').forEach(button => {
+          button.addEventListener('click', testSubscriptionNotification);
+        });
+
+        // 添加悬停功能
+        function addHoverListeners() {
+          // 计算悬浮提示位置
+          function positionTooltip(element, tooltip) {
+            const rect = element.getBoundingClientRect();
+            const tooltipHeight = 100; // 预估高度
+            const viewportHeight = window.innerHeight;
+            const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+
+            let top = rect.bottom + scrollTop + 8;
+            let left = rect.left;
+
+            // 如果下方空间不够，显示在上方
+            if (rect.bottom + tooltipHeight > viewportHeight) {
+              top = rect.top + scrollTop - tooltipHeight - 8;
+              tooltip.style.transform = 'translateY(10px)';
+              // 调整箭头位置
+              tooltip.classList.add('tooltip-above');
+            } else {
+              tooltip.style.transform = 'translateY(-10px)';
+              tooltip.classList.remove('tooltip-above');
+            }
+
+            // 确保不超出右边界
+            const maxLeft = window.innerWidth - 320 - 20;
+            if (left > maxLeft) {
+              left = maxLeft;
+            }
+
+            tooltip.style.left = left + 'px';
+            tooltip.style.top = top + 'px';
+          }
+
+          // 备注悬停功能
+          document.querySelectorAll('.notes-text').forEach(notesElement => {
+            const fullNotes = notesElement.getAttribute('data-full-notes');
+            const tooltip = notesElement.parentElement.querySelector('.notes-tooltip');
+
+            if (fullNotes && tooltip) {
+              notesElement.addEventListener('mouseenter', () => {
+                tooltip.textContent = fullNotes;
+                positionTooltip(notesElement, tooltip);
+                tooltip.classList.add('show');
+              });
+
+              notesElement.addEventListener('mouseleave', () => {
+                tooltip.classList.remove('show');
+              });
+
+              // 滚动时隐藏提示
+              window.addEventListener('scroll', () => {
+                if (tooltip.classList.contains('show')) {
+                  tooltip.classList.remove('show');
+                }
+              }, { passive: true });
+            }
+          });
+
+          // 通用悬停功能
+          document.querySelectorAll('.hover-text').forEach(hoverElement => {
+            const fullText = hoverElement.getAttribute('data-full-text');
+            const tooltip = hoverElement.parentElement.querySelector('.hover-tooltip');
+
+            if (fullText && tooltip) {
+              hoverElement.addEventListener('mouseenter', () => {
+                tooltip.textContent = fullText;
+                positionTooltip(hoverElement, tooltip);
+                tooltip.classList.add('show');
+              });
+
+              hoverElement.addEventListener('mouseleave', () => {
+                tooltip.classList.remove('show');
+              });
+
+              // 滚动时隐藏提示
+              window.addEventListener('scroll', () => {
+                if (tooltip.classList.contains('show')) {
+                  tooltip.classList.remove('show');
+                }
+              }, { passive: true });
+            }
+          });
         }
 
-        const response = await fetch('/api/subscriptions');
-        const data = await response.json();
+        addHoverListeners();
 
-        subscriptionsCache = Array.isArray(data) ? data : [];
-        populateCategoryFilter(subscriptionsCache);
-        renderSubscriptionTable();
+        // 添加农历开关事件监听
+        if (listShowLunar) {
+          listShowLunar.removeEventListener('change', handleListLunarToggle);
+          listShowLunar.addEventListener('change', handleListLunarToggle);
+        }
       } catch (error) {
         console.error('加载订阅失败:', error);
         const tbody = document.getElementById('subscriptionsBody');
-        if (tbody) {
-          tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-red-500"><i class="fas fa-exclamation-circle mr-2"></i>加载失败，请刷新页面重试</td></tr>';
-        }
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-red-500"><i class="fas fa-exclamation-circle mr-2"></i>加载失败，请刷新页面重试</td></tr>';
         showToast('加载订阅列表失败', 'error');
       }
     }
@@ -2101,8 +1939,11 @@ const lunarBiz = {
         button.disabled = true;
 
         try {
-            const response = await fetch('/api/subscriptions/' + id + '/test-notify', { method: 'POST' });
+            // --- 优化：使用动态 Base Path 构建 API URL ---
+            const response = await fetch(adminPrefix + '/api/subscriptions/' + id + '/test-notify', { method: 'POST' });
             const result = await response.json();
+            // --- 优化结束 ---
+
             if (result.success) {
                 showToast(result.message || '测试通知已发送', 'success');
             } else {
@@ -2128,11 +1969,13 @@ const lunarBiz = {
       button.disabled = true;
       
       try {
-        const response = await fetch('/api/subscriptions/' + id + '/toggle-status', {
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/subscriptions/' + id + '/toggle-status', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ isActive: isActivate })
         });
+        // --- 优化结束 ---
         
         if (response.ok) {
           showToast((isActivate ? '启用' : '停用') + '成功', 'success');
@@ -2161,9 +2004,7 @@ const lunarBiz = {
 
       const today = new Date().toISOString().split('T')[0]; // 前端使用本地时间
       document.getElementById('startDate').value = today;
-      document.getElementById('category').value = '';
-      document.getElementById('reminderValue').value = '7';
-      document.getElementById('reminderUnit').value = 'day';
+      document.getElementById('reminderDays').value = '7';
       document.getElementById('isActive').checked = true;
       document.getElementById('autoRenew').checked = true;
 
@@ -2223,22 +2064,6 @@ const lunarBiz = {
           this.input.removeEventListener('click', this._forceShowHandler);
           this._forceShowHandler = () => this.forceShow();
           this.input.addEventListener('click', this._forceShowHandler);
-          if (this._manualInputHandler) {
-            this.input.removeEventListener('blur', this._manualInputHandler);
-          }
-          this._manualInputHandler = () => this.syncFromInputValue();
-          this.input.addEventListener('blur', this._manualInputHandler);
-
-          if (this._manualKeydownHandler) {
-            this.input.removeEventListener('keydown', this._manualKeydownHandler);
-          }
-          this._manualKeydownHandler = (event) => {
-            if (event.key === 'Enter') {
-              event.preventDefault();
-              this.syncFromInputValue();
-            }
-          };
-          this.input.addEventListener('keydown', this._manualKeydownHandler);
         }
         
         if (this.prevBtn) {
@@ -2329,7 +2154,6 @@ const lunarBiz = {
         document.addEventListener('click', this._outsideClickHandler);
         
         // 初始化显示
-        this.syncFromInputValue();
         this.render();
         this.renderYearGrid();
       }
@@ -2404,43 +2228,6 @@ const lunarBiz = {
           const event = new Event('change', { bubbles: false });
           this.input.dispatchEvent(event);
         }
-      }
-
-      syncFromInputValue() {
-        if (!this.input) {
-          return;
-        }
-        const value = this.input.value.trim();
-        if (!value) {
-          this.selectedDate = null;
-          return;
-        }
-
-        const match = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-        if (!match) {
-          if (typeof showToast === 'function') {
-            showToast('日期格式需为 YYYY-MM-DD', 'warning');
-          }
-          return;
-        }
-
-        const year = Number(match[1]);
-        const month = Number(match[2]);
-        const day = Number(match[3]);
-        const parsed = new Date(year, month - 1, day);
-        if (isNaN(parsed.getTime()) || parsed.getFullYear() !== year || parsed.getMonth() !== month - 1 || parsed.getDate() !== day) {
-          if (typeof showToast === 'function') {
-            showToast('请输入有效的日期', 'warning');
-          }
-          return;
-        }
-
-        this.selectedDate = parsed;
-        this.currentDate = new Date(parsed);
-        this.render();
-
-        const event = new Event('change', { bubbles: false });
-        this.input.dispatchEvent(event);
       }
       
       render() {
@@ -2629,12 +2416,6 @@ const lunarBiz = {
         // 清理事件监听器
         if (this.input && this._forceShowHandler) {
           this.input.removeEventListener('click', this._forceShowHandler);
-        }
-        if (this.input && this._manualInputHandler) {
-          this.input.removeEventListener('blur', this._manualInputHandler);
-        }
-        if (this.input && this._manualKeydownHandler) {
-          this.input.removeEventListener('keydown', this._manualKeydownHandler);
         }
         if (this.prevBtn && this._prevHandler) {
           this.prevBtn.removeEventListener('click', this._prevHandler);
@@ -2828,25 +2609,18 @@ const lunarBiz = {
       }
       
       const id = document.getElementById('subscriptionId').value;
-      const reminderUnit = document.getElementById('reminderUnit').value;
-      const reminderValue = Number(document.getElementById('reminderValue').value) || 0;
-
       const subscription = {
         name: document.getElementById('name').value.trim(),
         customType: document.getElementById('customType').value.trim(),
-        category: document.getElementById('category').value.trim(),
         notes: document.getElementById('notes').value.trim() || '',
         isActive: document.getElementById('isActive').checked,
         autoRenew: document.getElementById('autoRenew').checked,
         startDate: document.getElementById('startDate').value,
         expiryDate: document.getElementById('expiryDate').value,
-        periodValue: Number(document.getElementById('periodValue').value),
+        periodValue: parseInt(document.getElementById('periodValue').value),
         periodUnit: document.getElementById('periodUnit').value,
-        reminderUnit: reminderUnit,
-        reminderValue: reminderValue,
-        reminderDays: reminderUnit === 'day' ? reminderValue : 0,
-        reminderHours: reminderUnit === 'hour' ? reminderValue : undefined,
-        useLunar: document.getElementById('useLunar').checked
+        reminderDays: parseInt(document.getElementById('reminderDays').value) || 0,
+		useLunar: document.getElementById('useLunar').checked // 新增修改
       };
       
       const submitButton = e.target.querySelector('button[type="submit"]');
@@ -2855,9 +2629,11 @@ const lunarBiz = {
       submitButton.disabled = true;
       
       try {
-        const url = id ? '/api/subscriptions/' + id : '/api/subscriptions';
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const url = id ? adminPrefix + '/api/subscriptions/' + id : adminPrefix + '/api/subscriptions';
         const method = id ? 'PUT' : 'POST';
-        
+        // --- 优化结束 ---
+
         const response = await fetch(url, {
           method: method,
           headers: { 'Content-Type': 'application/json' },
@@ -2887,15 +2663,16 @@ const lunarBiz = {
       const id = e.target.dataset.id || e.target.parentElement.dataset.id;
       
       try {
-        const response = await fetch('/api/subscriptions/' + id);
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/subscriptions/' + id);
         const subscription = await response.json();
+        // --- 优化结束 ---
         
         if (subscription) {
           document.getElementById('modalTitle').textContent = '编辑订阅';
           document.getElementById('subscriptionId').value = subscription.id;
           document.getElementById('name').value = subscription.name;
           document.getElementById('customType').value = subscription.customType || '';
-          document.getElementById('category').value = subscription.category || '';
           document.getElementById('notes').value = subscription.notes || '';
           document.getElementById('isActive').checked = subscription.isActive !== false;
           document.getElementById('autoRenew').checked = subscription.autoRenew !== false;
@@ -2903,28 +2680,8 @@ const lunarBiz = {
           document.getElementById('expiryDate').value = subscription.expiryDate ? subscription.expiryDate.split('T')[0] : '';
           document.getElementById('periodValue').value = subscription.periodValue || 1;
           document.getElementById('periodUnit').value = subscription.periodUnit || 'month';
-          const reminderUnit = subscription.reminderUnit || (subscription.reminderHours !== undefined ? 'hour' : 'day');
-          let reminderValue;
-          if (reminderUnit === 'hour') {
-            if (subscription.reminderValue !== undefined && subscription.reminderValue !== null) {
-              reminderValue = subscription.reminderValue;
-            } else if (subscription.reminderHours !== undefined) {
-              reminderValue = subscription.reminderHours;
-            } else {
-              reminderValue = 0;
-            }
-          } else {
-            if (subscription.reminderValue !== undefined && subscription.reminderValue !== null) {
-              reminderValue = subscription.reminderValue;
-            } else if (subscription.reminderDays !== undefined) {
-              reminderValue = subscription.reminderDays;
-            } else {
-              reminderValue = 7;
-            }
-          }
-          document.getElementById('reminderUnit').value = reminderUnit;
-          document.getElementById('reminderValue').value = reminderValue;
-          document.getElementById('useLunar').checked = !!subscription.useLunar;
+          document.getElementById('reminderDays').value = subscription.reminderDays !== undefined ? subscription.reminderDays : 7;
+		  document.getElementById('useLunar').checked = !!subscription.useLunar; // 新增修改
           
           clearFieldErrors();
           loadLunarPreference();
@@ -2958,9 +2715,11 @@ const lunarBiz = {
       button.disabled = true;
       
       try {
-        const response = await fetch('/api/subscriptions/' + id, {
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/subscriptions/' + id, {
           method: 'DELETE'
         });
+        // --- 优化结束 ---
         
         if (response.ok) {
           showToast('删除成功', 'success');
@@ -3008,9 +2767,11 @@ const lunarBiz = {
     // 实时显示系统时间和时区
     async function showSystemTime() {
       try {
-        // 获取后台配置的时区
-        const response = await fetch('/api/config');
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/config');
         const config = await response.json();
+        // --- 优化结束 ---
+
         globalTimezone = config.TIMEZONE || 'UTC';
         
         // 格式化当前时间
@@ -3079,8 +2840,10 @@ const lunarBiz = {
         // 定期检查时区变化并重新加载订阅列表（每30秒检查一次）
         setInterval(async () => {
           try {
-            const response = await fetch('/api/config');
+            // --- 优化：使用动态 Base Path 构建 API URL ---
+            const response = await fetch(adminPrefix + '/api/config');
             const config = await response.json();
+            // --- 优化结束 ---
             const newTimezone = config.TIMEZONE || 'UTC';
             
             if (globalTimezone !== newTimezone) {
@@ -3164,13 +2927,13 @@ const configPage = `
           <span id="systemTimeDisplay" class="ml-4 text-base text-indigo-600 font-normal"></span>
         </div>
         <div class="flex items-center space-x-4">
-          <a href="/admin" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
+           <a href="/admin" class="nav-link text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-list mr-1"></i>订阅列表
           </a>
-          <a href="/admin/config" class="text-indigo-600 border-b-2 border-indigo-600 px-3 py-2 rounded-md text-sm font-medium">
+          <a href="/admin/config" class="nav-link text-indigo-600 border-b-2 border-indigo-600 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-cog mr-1"></i>系统配置
           </a>
-          <a href="/api/logout" class="text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
+          <a href="/api/logout" class="nav-link text-gray-700 hover:text-gray-900 px-3 py-2 rounded-md text-sm font-medium">
             <i class="fas fa-sign-out-alt mr-1"></i>退出登录
           </a>
         </div>
@@ -3236,26 +2999,13 @@ const configPage = `
             <option value="Australia/Melbourne">墨尔本时间（UTC+10）</option>
             <option value="Pacific/Auckland">奥克兰时间（UTC+12）</option>
           </select>
-            <p class="mt-1 text-sm text-gray-500">选择需要使用时区，系统会按该时区计算剩余时间（提醒 Cron 仍基于 UTC，请在 Cloudflare 控制台换算触发时间）</p>
+            <p class="mt-1 text-sm text-gray-500">选择需要使用时区，计算到期日期</p>
           </div>
         </div>
 
         
         <div class="border-b border-gray-200 pb-6">
           <h3 class="text-lg font-medium text-gray-900 mb-4">通知设置</h3>
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-            <div>
-              <label for="notificationHours" class="block text-sm font-medium text-gray-700">通知时段（UTC）</label>
-              <input type="text" id="notificationHours" placeholder="例如：08, 12, 20 或输入 * 表示全天"
-                class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-              <p class="mt-1 text-sm text-gray-500">可输入多个小时，使用逗号或空格分隔；留空则默认每天执行一次任务即可</p>
-            </div>
-            <div class="bg-indigo-50 border border-indigo-100 rounded-md p-3 text-sm text-indigo-700">
-              <p class="font-medium mb-1">提示</p>
-              <p>Cloudflare Workers Cron 以 UTC 计算，例如北京时间 08:00 需设置 Cron 为 <code>0 0 * * *</code> 并在此填入 08。</p>
-              <p class="mt-1">若 Cron 已设置为每小时执行，可用该字段限制实际发送提醒的小时段。</p>
-            </div>
-          </div>
           <div class="mb-6">
             <label class="block text-sm font-medium text-gray-700 mb-3">通知方式（可多选）</label>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -3269,7 +3019,7 @@ const configPage = `
               </label>
               <label class="inline-flex items-center">
                 <input type="checkbox" name="enabledNotifiers" value="webhook" class="form-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
-                <span class="ml-2 text-sm text-gray-700">Webhook 通知</span>
+                <span class="ml-2 text-sm text-gray-700">企业微信应用通知</span>
               </label>
               <label class="inline-flex items-center">
                 <input type="checkbox" name="enabledNotifiers" value="wechatbot" class="form-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
@@ -3279,17 +3029,13 @@ const configPage = `
                 <input type="checkbox" name="enabledNotifiers" value="email" class="form-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
                 <span class="ml-2 text-sm text-gray-700">邮件通知</span>
               </label>
-              <label class="inline-flex items-center">
-                <input type="checkbox" name="enabledNotifiers" value="bark" class="form-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
-                <span class="ml-2 text-sm text-gray-700">Bark</span>
-              </label>
             </div>
             <div class="mt-2 flex flex-wrap gap-4">
               <a href="https://www.notifyx.cn/" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
                 <i class="fas fa-external-link-alt ml-1"></i> NotifyX官网
               </a>
-              <a href="https://webhook.site" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
-                <i class="fas fa-external-link-alt ml-1"></i> Webhook 调试工具
+              <a href="https://push.wangwangit.com" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
+                <i class="fas fa-external-link-alt ml-1"></i> 企业微信应用通知官网
               </a>
               <a href="https://developer.work.weixin.qq.com/document/path/91770" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
                 <i class="fas fa-external-link-alt ml-1"></i> 企业微信机器人文档
@@ -3297,22 +3043,7 @@ const configPage = `
               <a href="https://developers.cloudflare.com/workers/tutorials/send-emails-with-resend/" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
                 <i class="fas fa-external-link-alt ml-1"></i> 获取 Resend API Key
               </a>
-              <a href="https://apps.apple.com/cn/app/bark-customed-notifications/id1403753865" target="_blank" class="text-indigo-600 hover:text-indigo-800 text-sm">
-                <i class="fas fa-external-link-alt ml-1"></i> Bark iOS应用
-              </a>
             </div>
-          </div>
-
-          <div class="mb-6">
-            <label for="thirdPartyToken" class="block text-sm font-medium text-gray-700">第三方 API 访问令牌</label>
-            <div class="mt-1 flex flex-col sm:flex-row sm:items-center gap-3">
-              <input type="text" id="thirdPartyToken" placeholder="建议使用随机字符串，例如：iH5s9vB3..."
-                class="flex-1 border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-              <button type="button" id="generateThirdPartyToken" class="btn-info text-white px-4 py-2 rounded-md text-sm font-medium whitespace-nowrap">
-                <i class="fas fa-magic mr-2"></i>生成令牌
-              </button>
-            </div>
-            <p class="mt-1 text-sm text-gray-500">调用 /api/notify/{token} 接口时需携带此令牌；留空表示禁用第三方 API 推送。</p>
           </div>
           
           <div id="telegramConfig" class="config-section">
@@ -3349,12 +3080,12 @@ const configPage = `
           </div>
 
           <div id="webhookConfig" class="config-section">
-            <h4 class="text-md font-medium text-gray-900 mb-3">Webhook 通知 配置</h4>
+            <h4 class="text-md font-medium text-gray-900 mb-3">企业微信应用通知 配置</h4>
             <div class="grid grid-cols-1 gap-4 mb-4">
               <div>
-                <label for="webhookUrl" class="block text-sm font-medium text-gray-700">Webhook 通知 URL</label>
-                <input type="url" id="webhookUrl" placeholder="https://your-webhook-endpoint.com/path" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-                <p class="mt-1 text-sm text-gray-500">请填写自建服务或第三方平台提供的 Webhook 地址，例如 <code>https://your-webhook-endpoint.com/path</code></p>
+                <label for="webhookUrl" class="block text-sm font-medium text-gray-700">企业微信应用通知 URL</label>
+                <input type="url" id="webhookUrl" placeholder="https://push.wangwangit.com/api/send/your-key" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                <p class="mt-1 text-sm text-gray-500">从 <a href="https://push.wangwangit.com" target="_blank" class="text-indigo-600 hover:text-indigo-800">企业微信应用通知平台</a> 获取的推送URL</p>
               </div>
               <div>
                 <label for="webhookMethod" class="block text-sm font-medium text-gray-700">请求方法</label>
@@ -3377,7 +3108,7 @@ const configPage = `
             </div>
             <div class="flex justify-end">
               <button type="button" id="testWebhookBtn" class="btn-secondary text-white px-4 py-2 rounded-md text-sm font-medium">
-                <i class="fas fa-paper-plane mr-2"></i>测试 Webhook 通知
+                <i class="fas fa-paper-plane mr-2"></i>测试 企业微信应用通知
               </button>
             </div>
           </div>
@@ -3448,35 +3179,6 @@ const configPage = `
               </button>
             </div>
           </div>
-
-          <div id="barkConfig" class="config-section">
-            <h4 class="text-md font-medium text-gray-900 mb-3">Bark 配置</h4>
-            <div class="grid grid-cols-1 gap-4 mb-4">
-              <div>
-                <label for="barkServer" class="block text-sm font-medium text-gray-700">服务器地址</label>
-                <input type="url" id="barkServer" placeholder="https://api.day.app" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-                <p class="mt-1 text-sm text-gray-500">Bark 服务器地址，默认为官方服务器，也可以使用自建服务器</p>
-              </div>
-              <div>
-                <label for="barkDeviceKey" class="block text-sm font-medium text-gray-700">设备Key</label>
-                <input type="text" id="barkDeviceKey" placeholder="从Bark应用获取的设备Key" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
-                <p class="mt-1 text-sm text-gray-500">从 <a href="https://apps.apple.com/cn/app/bark-customed-notifications/id1403753865" target="_blank" class="text-indigo-600 hover:text-indigo-800">Bark iOS 应用</a> 中获取的设备Key</p>
-              </div>
-              <div>
-                <label for="barkIsArchive" class="block text-sm font-medium text-gray-700 mb-2">保存推送</label>
-                <label class="inline-flex items-center">
-                  <input type="checkbox" id="barkIsArchive" class="form-checkbox h-4 w-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500">
-                  <span class="ml-2 text-sm text-gray-700">保存推送到历史记录</span>
-                </label>
-                <p class="mt-1 text-sm text-gray-500">勾选后推送消息会保存到 Bark 的历史记录中</p>
-              </div>
-            </div>
-            <div class="flex justify-end">
-              <button type="button" id="testBarkBtn" class="btn-secondary text-white px-4 py-2 rounded-md text-sm font-medium">
-                <i class="fas fa-paper-plane mr-2"></i>测试 Bark 通知
-              </button>
-            </div>
-          </div>
         </div>
 
         <div class="flex justify-end">
@@ -3489,6 +3191,32 @@ const configPage = `
   </div>
 
   <script>
+    // --- 优化开始：动态确定 Admin Base Path ---
+    // 确定 Base Path，例如 /notice
+    let adminPrefix = window.location.pathname.replace('/admin', '').replace('/config', '').replace(/\/$/, '');
+    if (!adminPrefix) {
+        adminPrefix = '';
+    }
+    
+    // 全局修正所有以 /admin 或 /api 开头的链接
+    function updateLinks() {
+        document.querySelectorAll('a[href]').forEach(link => {
+            let originalHref = link.getAttribute('href');
+            if (originalHref) {
+                if (originalHref.startsWith('/admin') || originalHref.startsWith('/api')) {
+                    // 如果链接还没有 Base Path，则添加
+                    if (!originalHref.startsWith(adminPrefix + '/admin') && !originalHref.startsWith(adminPrefix + '/api')) {
+                       link.setAttribute('href', adminPrefix + originalHref);
+                    }
+                }
+            }
+        });
+    }
+
+    // 在页面加载后调用链接修正函数
+    window.addEventListener('load', updateLinks);
+    // --- 优化结束 ---
+
     function showToast(message, type = 'success', duration = 3000) {
       const container = document.getElementById('toast-container');
       const toast = document.createElement('div');
@@ -3514,8 +3242,10 @@ const configPage = `
 
     async function loadConfig() {
       try {
-        const response = await fetch('/api/config');
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/config');
         const config = await response.json();
+        // --- 优化结束 ---
 
         document.getElementById('adminUsername').value = config.ADMIN_USERNAME || '';
         document.getElementById('tgBotToken').value = config.TG_BOT_TOKEN || '';
@@ -3533,16 +3263,6 @@ const configPage = `
         document.getElementById('emailFrom').value = config.EMAIL_FROM || '';
         document.getElementById('emailFromName').value = config.EMAIL_FROM_NAME || '订阅提醒系统';
         document.getElementById('emailTo').value = config.EMAIL_TO || '';
-        document.getElementById('barkServer').value = config.BARK_SERVER || 'https://api.day.app';
-        document.getElementById('barkDeviceKey').value = config.BARK_DEVICE_KEY || '';
-        document.getElementById('barkIsArchive').checked = config.BARK_IS_ARCHIVE === 'true';
-        document.getElementById('thirdPartyToken').value = config.THIRD_PARTY_API_TOKEN || '';
-        const notificationHoursInput = document.getElementById('notificationHours');
-        if (notificationHoursInput) {
-          // 将通知小时数组格式化为逗号分隔的字符串，便于管理员查看与编辑
-          const hours = Array.isArray(config.NOTIFICATION_HOURS) ? config.NOTIFICATION_HOURS : [];
-          notificationHoursInput.value = hours.join(', ');
-        }
         
         // 加载农历显示设置
         document.getElementById('showLunarGlobal').checked = config.SHOW_LUNAR === true;
@@ -3609,10 +3329,9 @@ const configPage = `
       const webhookConfig = document.getElementById('webhookConfig');
       const wechatbotConfig = document.getElementById('wechatbotConfig');
       const emailConfig = document.getElementById('emailConfig');
-      const barkConfig = document.getElementById('barkConfig');
 
       // 重置所有配置区域
-      [telegramConfig, notifyxConfig, webhookConfig, wechatbotConfig, emailConfig, barkConfig].forEach(config => {
+      [telegramConfig, notifyxConfig, webhookConfig, wechatbotConfig, emailConfig].forEach(config => {
         config.classList.remove('active', 'inactive');
         config.classList.add('inactive');
       });
@@ -3634,9 +3353,6 @@ const configPage = `
         } else if (type === 'email') {
           emailConfig.classList.remove('inactive');
           emailConfig.classList.add('active');
-        } else if (type === 'bark') {
-          barkConfig.classList.remove('inactive');
-          barkConfig.classList.add('active');
         }
       });
     }
@@ -3678,23 +3394,8 @@ const configPage = `
         EMAIL_FROM: document.getElementById('emailFrom').value.trim(),
         EMAIL_FROM_NAME: document.getElementById('emailFromName').value.trim(),
         EMAIL_TO: document.getElementById('emailTo').value.trim(),
-        BARK_SERVER: document.getElementById('barkServer').value.trim() || 'https://api.day.app',
-        BARK_DEVICE_KEY: document.getElementById('barkDeviceKey').value.trim(),
-        BARK_IS_ARCHIVE: document.getElementById('barkIsArchive').checked.toString(),
         ENABLED_NOTIFIERS: enabledNotifiers,
-        TIMEZONE: document.getElementById('timezone').value.trim(),
-        THIRD_PARTY_API_TOKEN: document.getElementById('thirdPartyToken').value.trim(),
-        // 前端先行整理通知小时列表，后端仍会再次校验
-        NOTIFICATION_HOURS: (() => {
-          const raw = document.getElementById('notificationHours').value.trim();
-          if (!raw) {
-            return [];
-          }
-          return raw
-            .split(/[,，\s]+/)
-            .map(item => item.trim())
-            .filter(item => item.length > 0);
-        })()
+        TIMEZONE: document.getElementById('timezone').value.trim()
       };
 
       const passwordField = document.getElementById('adminPassword');
@@ -3708,11 +3409,13 @@ const configPage = `
       submitButton.disabled = true;
 
       try {
-        const response = await fetch('/api/config', {
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(config)
         });
+        // --- 优化结束 ---
 
         const result = await response.json();
 
@@ -3728,8 +3431,9 @@ const configPage = `
           localStorage.setItem('timezoneUpdated', Date.now().toString());
           
           // 如果当前在订阅列表页面，则自动刷新页面以更新时区显示
-          if (window.location.pathname === '/admin') {
-            window.location.reload();
+          if (window.location.pathname.startsWith(adminPrefix + '/admin')) {
+            // 注意：这里不用 reload，因为 showSystemTime 会重新加载订阅列表，只需要跳转到正确的 admin 根路径
+            window.location.href = adminPrefix + '/admin';
           }
         } else {
           showToast('配置保存失败: ' + (result.message || '未知错误'), 'error');
@@ -3747,15 +3451,13 @@ const configPage = `
       const buttonId = type === 'telegram' ? 'testTelegramBtn' :
                       type === 'notifyx' ? 'testNotifyXBtn' :
                       type === 'wechatbot' ? 'testWechatBotBtn' :
-                      type === 'email' ? 'testEmailBtn' :
-                      type === 'bark' ? 'testBarkBtn' : 'testWebhookBtn';
+                      type === 'email' ? 'testEmailBtn' : 'testWebhookBtn';
       const button = document.getElementById(buttonId);
       const originalContent = button.innerHTML;
       const serviceName = type === 'telegram' ? 'Telegram' :
                           type === 'notifyx' ? 'NotifyX' :
                           type === 'wechatbot' ? '企业微信机器人' :
-                          type === 'email' ? '邮件通知' :
-                          type === 'bark' ? 'Bark' : 'Webhook 通知';
+                          type === 'email' ? '邮件通知' : '企业微信应用通知';
 
       button.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>测试中...';
       button.disabled = true;
@@ -3787,7 +3489,7 @@ const configPage = `
         config.WEBHOOK_TEMPLATE = document.getElementById('webhookTemplate').value.trim();
 
         if (!config.WEBHOOK_URL) {
-          showToast('请先填写 Webhook 通知 URL', 'warning');
+          showToast('请先填写 企业微信应用通知 URL', 'warning');
           button.innerHTML = originalContent;
           button.disabled = false;
           return;
@@ -3816,25 +3518,16 @@ const configPage = `
           button.disabled = false;
           return;
         }
-      } else if (type === 'bark') {
-        config.BARK_SERVER = document.getElementById('barkServer').value.trim() || 'https://api.day.app';
-        config.BARK_DEVICE_KEY = document.getElementById('barkDeviceKey').value.trim();
-        config.BARK_IS_ARCHIVE = document.getElementById('barkIsArchive').checked.toString();
-
-        if (!config.BARK_DEVICE_KEY) {
-          showToast('请先填写 Bark 设备Key', 'warning');
-          button.innerHTML = originalContent;
-          button.disabled = false;
-          return;
-        }
       }
 
       try {
-        const response = await fetch('/api/test-notification', {
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/test-notification', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ type: type, ...config })
         });
+        // --- 优化结束 ---
 
         const result = await response.json();
 
@@ -3872,27 +3565,6 @@ const configPage = `
       testNotification('email');
     });
 
-    document.getElementById('testBarkBtn').addEventListener('click', () => {
-      testNotification('bark');
-    });
-
-    document.getElementById('generateThirdPartyToken').addEventListener('click', () => {
-      try {
-        // 生成 32 位随机令牌，避免出现特殊字符，方便写入 URL
-        const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-        const buffer = new Uint8Array(32);
-        window.crypto.getRandomValues(buffer);
-        const token = Array.from(buffer).map(v => charset[v % charset.length]).join('');
-        const input = document.getElementById('thirdPartyToken');
-        input.value = token;
-        input.dispatchEvent(new Event('input'));
-        showToast('已生成新的第三方 API 令牌，请保存配置后生效', 'info');
-      } catch (error) {
-        console.error('生成令牌失败:', error);
-        showToast('生成令牌失败，请手动输入', 'error');
-      }
-    });
-
     window.addEventListener('load', loadConfig);
     
     // 全局时区配置
@@ -3901,9 +3573,11 @@ const configPage = `
     // 实时显示系统时间和时区
     async function showSystemTime() {
       try {
-        // 获取后台配置的时区
-        const response = await fetch('/api/config');
+        // --- 优化：使用动态 Base Path 构建 API URL ---
+        const response = await fetch(adminPrefix + '/api/config');
         const config = await response.json();
+        // --- 优化结束 ---
+
         globalTimezone = config.TIMEZONE || 'UTC';
         
         // 格式化当前时间
@@ -3972,15 +3646,17 @@ const configPage = `
         // 定期检查时区变化并重新加载订阅列表（每30秒检查一次）
         setInterval(async () => {
           try {
-            const response = await fetch('/api/config');
+            // --- 优化：使用动态 Base Path 构建 API URL ---
+            const response = await fetch(adminPrefix + '/api/config');
             const config = await response.json();
+            // --- 优化结束 ---
             const newTimezone = config.TIMEZONE || 'UTC';
             
             if (globalTimezone !== newTimezone) {
               globalTimezone = newTimezone;
               console.log('时区已更新为:', globalTimezone);
               // 重新加载订阅列表以更新天数计算
-              loadSubscriptions();
+              // loadSubscriptions(); // 在 config 页面不需要加载列表
             }
           } catch (error) {
             console.error('检查时区更新失败:', error);
@@ -4001,40 +3677,19 @@ const configPage = `
 `;
 
 // 管理页面
-// 与前端一致的分类切割正则，用于提取标签信息
-const CATEGORY_SEPARATOR_REGEX = /[\/,，\s]+/;
-
-function extractTagsFromSubscriptions(subscriptions = []) {
-  const tagSet = new Set();
-  (subscriptions || []).forEach(sub => {
-    if (!sub || typeof sub !== 'object') {
-      return;
-    }
-    if (Array.isArray(sub.tags)) {
-      sub.tags.forEach(tag => {
-        if (typeof tag === 'string' && tag.trim().length > 0) {
-          tagSet.add(tag.trim());
-        }
-      });
-    }
-    if (typeof sub.category === 'string') {
-      sub.category.split(CATEGORY_SEPARATOR_REGEX)
-        .map(tag => tag.trim())
-        .filter(tag => tag.length > 0)
-        .forEach(tag => tagSet.add(tag));
-    }
-    if (typeof sub.customType === 'string' && sub.customType.trim().length > 0) {
-      tagSet.add(sub.customType.trim());
-    }
-  });
-  return Array.from(tagSet);
-}
-
 const admin = {
   async handleRequest(request, env, ctx) {
     try {
       const url = new URL(request.url);
       const pathname = url.pathname;
+
+      // --- 优化开始：动态确定 Base Path 用于重定向 ---
+      // 从路径中提取子路径，例如 /notice/admin -> /notice
+      let basePath = pathname.replace('/admin', '').replace('/config', '').replace(/\/$/, '');
+      if (!basePath) {
+          basePath = '';
+      }
+      // --- 优化结束 ---
 
       console.log('[管理页面] 访问路径:', pathname);
 
@@ -4050,11 +3705,13 @@ const admin = {
         console.log('[管理页面] 用户未登录，重定向到登录页面');
         return new Response('', {
           status: 302,
-          headers: { 'Location': '/' }
+          // --- 优化：重定向到带 base path 的根路径 ---
+          headers: { 'Location': basePath || '/' }
+          // --- 优化结束 ---
         });
       }
 
-      if (pathname === '/admin/config') {
+      if (pathname.endsWith('/admin/config')) {
         return new Response(configPage, {
           headers: { 'Content-Type': 'text/html; charset=utf-8' }
         });
@@ -4106,10 +3763,17 @@ const api = {
     }
 
     if (path === '/logout' && (method === 'GET' || method === 'POST')) {
+      // --- 优化开始：动态确定 Base Path 用于重定向 ---
+      // 从 /api/logout 前的部分提取子路径，例如 /notice/api/logout -> /notice
+      let basePath = url.pathname.substring(0, url.pathname.indexOf('/api')) || '/';
+      // --- 优化结束 ---
+
       return new Response('', {
         status: 302,
         headers: {
-          'Location': '/',
+          // --- 优化：重定向到带 base path 的根路径 ---
+          'Location': basePath,
+          // --- 优化结束 ---
           'Set-Cookie': 'token=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0'
         }
       });
@@ -4157,36 +3821,9 @@ const api = {
             EMAIL_FROM: newConfig.EMAIL_FROM || '',
             EMAIL_FROM_NAME: newConfig.EMAIL_FROM_NAME || '',
             EMAIL_TO: newConfig.EMAIL_TO || '',
-            BARK_DEVICE_KEY: newConfig.BARK_DEVICE_KEY || '',
-            BARK_SERVER: newConfig.BARK_SERVER || 'https://api.day.app',
-            BARK_IS_ARCHIVE: newConfig.BARK_IS_ARCHIVE || 'false',
             ENABLED_NOTIFIERS: newConfig.ENABLED_NOTIFIERS || ['notifyx'],
-            TIMEZONE: newConfig.TIMEZONE || config.TIMEZONE || 'UTC',
-            THIRD_PARTY_API_TOKEN: newConfig.THIRD_PARTY_API_TOKEN || ''
+            TIMEZONE: newConfig.TIMEZONE || config.TIMEZONE || 'UTC' // 新增时区字段
           };
-
-          const rawNotificationHours = Array.isArray(newConfig.NOTIFICATION_HOURS)
-            ? newConfig.NOTIFICATION_HOURS
-            : typeof newConfig.NOTIFICATION_HOURS === 'string'
-              ? newConfig.NOTIFICATION_HOURS.split(',')
-              : [];
-
-          const sanitizedNotificationHours = rawNotificationHours
-            .map(value => String(value).trim())
-            .filter(value => value.length > 0)
-            .map(value => {
-              const upperValue = value.toUpperCase();
-              if (upperValue === '*' || upperValue === 'ALL') {
-                return '*';
-              }
-              const numeric = Number(upperValue);
-              if (!isNaN(numeric)) {
-                return String(Math.max(0, Math.min(23, Math.floor(numeric)))).padStart(2, '0');
-              }
-              return upperValue;
-            });
-
-          updatedConfig.NOTIFICATION_HOURS = sanitizedNotificationHours;
 
           if (newConfig.ADMIN_PASSWORD) {
             updatedConfig.ADMIN_PASSWORD = newConfig.ADMIN_PASSWORD;
@@ -4252,10 +3889,10 @@ const api = {
           };
 
           const title = '测试通知';
-          const content = '这是一条测试通知，用于验证Webhook 通知功能是否正常工作。\n\n发送时间: ' + formatBeijingTime();
+          const content = '这是一条测试通知，用于验证企业微信应用通知功能是否正常工作。\n\n发送时间: ' + formatBeijingTime();
 
           success = await sendWebhookNotification(title, content, testConfig);
-          message = success ? 'Webhook 通知发送成功' : 'Webhook 通知发送失败，请检查配置';
+          message = success ? '企业微信应用通知发送成功' : '企业微信应用通知发送失败，请检查配置';
          } else if (body.type === 'wechatbot') {
           const testConfig = {
             ...config,
@@ -4284,19 +3921,6 @@ const api = {
 
           success = await sendEmailNotification(title, content, testConfig);
           message = success ? '邮件通知发送成功' : '邮件通知发送失败，请检查配置';
-        } else if (body.type === 'bark') {
-          const testConfig = {
-            ...config,
-            BARK_SERVER: body.BARK_SERVER,
-            BARK_DEVICE_KEY: body.BARK_DEVICE_KEY,
-            BARK_IS_ARCHIVE: body.BARK_IS_ARCHIVE
-          };
-
-          const title = '测试通知';
-          const content = '这是一条测试通知，用于验证Bark通知功能是否正常工作。\n\n发送时间: ' + formatBeijingTime();
-
-          success = await sendBarkNotification(title, content, testConfig);
-          message = success ? 'Bark通知发送成功' : 'Bark通知发送失败，请检查配置';
         }
 
         return new Response(
@@ -4394,28 +4018,7 @@ const api = {
 
     // 处理第三方通知API
     if (path.startsWith('/notify/')) {
-      const pathSegments = path.split('/');
-      // 允许通过路径、Authorization 头或查询参数三种方式传入访问令牌
-      const tokenFromPath = pathSegments[2] || '';
-      const tokenFromHeader = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim();
-      const tokenFromQuery = url.searchParams.get('token') || '';
-      const providedToken = tokenFromPath || tokenFromHeader || tokenFromQuery;
-      const expectedToken = config.THIRD_PARTY_API_TOKEN || '';
-
-      if (!expectedToken) {
-        return new Response(
-          JSON.stringify({ message: '第三方 API 已禁用，请在后台配置访问令牌后使用' }),
-          { status: 403, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-
-      if (!providedToken || providedToken !== expectedToken) {
-        return new Response(
-          JSON.stringify({ message: '访问未授权，令牌无效或缺失' }),
-          { status: 401, headers: { 'Content-Type': 'application/json' } }
-        );
-      }
-
+      const code = path.split('/')[2];
       if (method === 'POST') {
         try {
           const body = await request.json();
@@ -4430,17 +4033,9 @@ const api = {
           }
 
           const config = await getConfig(env);
-          const bodyTagsRaw = Array.isArray(body.tags)
-            ? body.tags
-            : (typeof body.tags === 'string' ? body.tags.split(/[,，\s]+/) : []);
-          const bodyTags = Array.isArray(bodyTagsRaw)
-            ? bodyTagsRaw.filter(tag => typeof tag === 'string' && tag.trim().length > 0).map(tag => tag.trim())
-            : [];
 
           // 使用多渠道发送通知
-          await sendNotificationToAllChannels(title, content, config, '[第三方API]', {
-            metadata: { tags: bodyTags }
-          });
+          await sendNotificationToAllChannels(title, content, config, '[第三方API]');
 
           return new Response(
             JSON.stringify({
@@ -4530,13 +4125,8 @@ async function getConfig(env) {
       EMAIL_FROM: config.EMAIL_FROM || '',
       EMAIL_FROM_NAME: config.EMAIL_FROM_NAME || '',
       EMAIL_TO: config.EMAIL_TO || '',
-      BARK_DEVICE_KEY: config.BARK_DEVICE_KEY || '',
-      BARK_SERVER: config.BARK_SERVER || 'https://api.day.app',
-      BARK_IS_ARCHIVE: config.BARK_IS_ARCHIVE || 'false',
       ENABLED_NOTIFIERS: config.ENABLED_NOTIFIERS || ['notifyx'],
-      TIMEZONE: config.TIMEZONE || 'UTC', // 新增时区字段
-      NOTIFICATION_HOURS: Array.isArray(config.NOTIFICATION_HOURS) ? config.NOTIFICATION_HOURS : [],
-      THIRD_PARTY_API_TOKEN: config.THIRD_PARTY_API_TOKEN || ''
+      TIMEZONE: config.TIMEZONE || 'UTC' // 新增时区字段
     };
 
     console.log('[配置] 最终配置用户名:', finalConfig.ADMIN_USERNAME);
@@ -4566,9 +4156,7 @@ async function getConfig(env) {
       EMAIL_FROM_NAME: '',
       EMAIL_TO: '',
       ENABLED_NOTIFIERS: ['notifyx'],
-      NOTIFICATION_HOURS: [],
-      TIMEZONE: 'UTC', // 新增时区字段
-      THIRD_PARTY_API_TOKEN: ''
+      TIMEZONE: 'UTC' // 新增时区字段
     };
   }
 }
@@ -4678,25 +4266,19 @@ async function createSubscription(subscription, env) {
       }
     }
 
-    const reminderSetting = resolveReminderSetting(subscription);
-
     const newSubscription = {
       id: Date.now().toString(), // 前端使用本地时间戳
       name: subscription.name,
       customType: subscription.customType || '',
-      category: subscription.category ? subscription.category.trim() : '',
       startDate: subscription.startDate || null,
       expiryDate: subscription.expiryDate,
       periodValue: subscription.periodValue || 1,
       periodUnit: subscription.periodUnit || 'month',
-      reminderUnit: reminderSetting.unit,
-      reminderValue: reminderSetting.value,
-      reminderDays: reminderSetting.unit === 'day' ? reminderSetting.value : undefined,
-      reminderHours: reminderSetting.unit === 'hour' ? reminderSetting.value : undefined,
+      reminderDays: subscription.reminderDays !== undefined ? subscription.reminderDays : 7,
       notes: subscription.notes || '',
       isActive: subscription.isActive !== false,
       autoRenew: subscription.autoRenew !== false,
-      useLunar: useLunar,
+      useLunar: useLunar, // 新增
       createdAt: new Date().toISOString()
     };
 
@@ -4764,31 +4346,19 @@ if (useLunar) {
       }
     }
 
-    const reminderSource = {
-      reminderUnit: subscription.reminderUnit !== undefined ? subscription.reminderUnit : subscriptions[index].reminderUnit,
-      reminderValue: subscription.reminderValue !== undefined ? subscription.reminderValue : subscriptions[index].reminderValue,
-      reminderHours: subscription.reminderHours !== undefined ? subscription.reminderHours : subscriptions[index].reminderHours,
-      reminderDays: subscription.reminderDays !== undefined ? subscription.reminderDays : subscriptions[index].reminderDays
-    };
-    const reminderSetting = resolveReminderSetting(reminderSource);
-
     subscriptions[index] = {
       ...subscriptions[index],
       name: subscription.name,
       customType: subscription.customType || subscriptions[index].customType || '',
-      category: subscription.category !== undefined ? subscription.category.trim() : (subscriptions[index].category || ''),
       startDate: subscription.startDate || subscriptions[index].startDate,
       expiryDate: subscription.expiryDate,
       periodValue: subscription.periodValue || subscriptions[index].periodValue || 1,
       periodUnit: subscription.periodUnit || subscriptions[index].periodUnit || 'month',
-      reminderUnit: reminderSetting.unit,
-      reminderValue: reminderSetting.value,
-      reminderDays: reminderSetting.unit === 'day' ? reminderSetting.value : undefined,
-      reminderHours: reminderSetting.unit === 'hour' ? reminderSetting.value : undefined,
+      reminderDays: subscription.reminderDays !== undefined ? subscription.reminderDays : (subscriptions[index].reminderDays !== undefined ? subscriptions[index].reminderDays : 7),
       notes: subscription.notes || '',
       isActive: subscription.isActive !== undefined ? subscription.isActive : subscriptions[index].isActive,
       autoRenew: subscription.autoRenew !== undefined ? subscription.autoRenew : (subscriptions[index].autoRenew !== undefined ? subscriptions[index].autoRenew : true),
-      useLunar: useLunar,
+      useLunar: useLunar, // 新增
       updatedAt: new Date().toISOString()
     };
 
@@ -4880,10 +4450,7 @@ async function testSingleSubscriptionNotification(id, env) {
 当前时区: ${formatTimezoneDisplay(timezone)}`;
 
     // 使用多渠道发送
-    const tags = extractTagsFromSubscriptions([subscription]);
-    await sendNotificationToAllChannels(title, commonContent, config, '[手动测试]', {
-      metadata: { tags }
-    });
+    await sendNotificationToAllChannels(title, commonContent, config, '[手动测试]');
 
     return { success: true, message: '测试通知已发送到所有启用的渠道' };
 
@@ -4893,14 +4460,14 @@ async function testSingleSubscriptionNotification(id, env) {
   }
 }
 
-async function sendWebhookNotification(title, content, config, metadata = {}) {
+async function sendWebhookNotification(title, content, config) {
   try {
     if (!config.WEBHOOK_URL) {
-      console.error('[Webhook通知] 通知未配置，缺少URL');
+      console.error('[企业微信应用通知] 通知未配置，缺少URL');
       return false;
     }
 
-    console.log('[Webhook通知] 开始发送通知到: ' + config.WEBHOOK_URL);
+    console.log('[企业微信应用通知] 开始发送通知到: ' + config.WEBHOOK_URL);
 
     let requestBody;
     let headers = { 'Content-Type': 'application/json' };
@@ -4911,74 +4478,24 @@ async function sendWebhookNotification(title, content, config, metadata = {}) {
         const customHeaders = JSON.parse(config.WEBHOOK_HEADERS);
         headers = { ...headers, ...customHeaders };
       } catch (error) {
-        console.warn('[Webhook通知] 自定义请求头格式错误，使用默认请求头');
+        console.warn('[企业微信应用通知] 自定义请求头格式错误，使用默认请求头');
       }
     }
-
-    const tagsArray = Array.isArray(metadata.tags)
-      ? metadata.tags.filter(tag => typeof tag === 'string' && tag.trim().length > 0).map(tag => tag.trim())
-      : [];
-    const tagsBlock = tagsArray.length ? tagsArray.map(tag => `- ${tag}`).join('\n') : '';
-    const tagsLine = tagsArray.length ? '标签：' + tagsArray.join('、') : '';
-    const timestamp = formatTimeInTimezone(new Date(), config?.TIMEZONE || 'UTC', 'datetime');
-    const formattedMessage = [title, content, tagsLine, `发送时间：${timestamp}`]
-      .filter(section => section && section.trim().length > 0)
-      .join('\n\n');
-
-    const templateData = {
-      title,
-      content,
-      tags: tagsBlock,
-      tagsLine,
-      rawTags: tagsArray,
-      timestamp,
-      formattedMessage,
-      message: formattedMessage
-    };
-
-    const escapeForJson = (value) => {
-      if (value === null || value === undefined) {
-        return '';
-      }
-      return JSON.stringify(String(value)).slice(1, -1);
-    };
-
-    const applyTemplate = (template, data) => {
-      const templateString = JSON.stringify(template);
-      const replaced = templateString.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_, key) => {
-        if (Object.prototype.hasOwnProperty.call(data, key)) {
-          return escapeForJson(data[key]);
-        }
-        return '';
-      });
-      return JSON.parse(replaced);
-    };
 
     // 处理消息模板
     if (config.WEBHOOK_TEMPLATE) {
       try {
         const template = JSON.parse(config.WEBHOOK_TEMPLATE);
-        requestBody = applyTemplate(template, templateData);
+        requestBody = JSON.stringify(template)
+          .replace(/\{\{title\}\}/g, title)
+          .replace(/\{\{content\}\}/g, content);
+        requestBody = JSON.parse(requestBody);
       } catch (error) {
-        console.warn('[Webhook通知] 消息模板格式错误，使用默认格式');
-        requestBody = {
-          title,
-          content,
-          tags: tagsArray,
-          tagsLine,
-          timestamp,
-          message: formattedMessage
-        };
+        console.warn('[企业微信应用通知] 消息模板格式错误，使用默认格式');
+        requestBody = { title, content };
       }
     } else {
-      requestBody = {
-        title,
-        content,
-        tags: tagsArray,
-        tagsLine,
-        timestamp,
-        message: formattedMessage
-      };
+      requestBody = { title, content };
     }
 
     const response = await fetch(config.WEBHOOK_URL, {
@@ -4988,10 +4505,10 @@ async function sendWebhookNotification(title, content, config, metadata = {}) {
     });
 
     const result = await response.text();
-    console.log('[Webhook通知] 发送结果:', response.status, result);
+    console.log('[企业微信应用通知] 发送结果:', response.status, result);
     return response.ok;
   } catch (error) {
-    console.error('[Webhook通知] 发送通知失败:', error);
+    console.error('[企业微信应用通知] 发送通知失败:', error);
     return false;
   }
 }
@@ -5090,52 +4607,6 @@ async function sendWechatBotNotification(title, content, config) {
 }
 
 // 优化通知内容格式
-function resolveReminderSetting(subscription) {
-  const defaultDays = subscription && subscription.reminderDays !== undefined ? Number(subscription.reminderDays) : 7;
-  let unit = subscription && subscription.reminderUnit === 'hour' ? 'hour' : 'day';
-
-  let value;
-  if (unit === 'hour') {
-    if (subscription && subscription.reminderValue !== undefined && subscription.reminderValue !== null && !isNaN(Number(subscription.reminderValue))) {
-      value = Number(subscription.reminderValue);
-    } else if (subscription && subscription.reminderHours !== undefined && subscription.reminderHours !== null && !isNaN(Number(subscription.reminderHours))) {
-      value = Number(subscription.reminderHours);
-    } else {
-      value = 0;
-    }
-  } else {
-    if (subscription && subscription.reminderValue !== undefined && subscription.reminderValue !== null && !isNaN(Number(subscription.reminderValue))) {
-      value = Number(subscription.reminderValue);
-    } else if (!isNaN(defaultDays)) {
-      value = Number(defaultDays);
-    } else {
-      value = 7;
-    }
-  }
-
-  if (value < 0 || isNaN(value)) {
-    value = 0;
-  }
-
-  return { unit, value };
-}
-
-function shouldTriggerReminder(reminder, daysDiff, hoursDiff) {
-  if (!reminder) {
-    return false;
-  }
-  if (reminder.unit === 'hour') {
-    if (reminder.value === 0) {
-      return hoursDiff >= 0 && hoursDiff < 1;
-    }
-    return hoursDiff >= 0 && hoursDiff <= reminder.value;
-  }
-  if (reminder.value === 0) {
-    return daysDiff === 0;
-  }
-  return daysDiff >= 0 && daysDiff <= reminder.value;
-}
-
 function formatNotificationContent(subscriptions, config) {
   const showLunar = config.SHOW_LUNAR === true;
   const timezone = config?.TIMEZONE || 'UTC';
@@ -5144,8 +4615,6 @@ function formatNotificationContent(subscriptions, config) {
   for (const sub of subscriptions) {
     const typeText = sub.customType || '其他';
     const periodText = (sub.periodValue && sub.periodUnit) ? `(周期: ${sub.periodValue} ${ { day: '天', month: '月', year: '年' }[sub.periodUnit] || sub.periodUnit})` : '';
-    const categoryText = sub.category ? sub.category : '未分类';
-    const reminderSetting = resolveReminderSetting(sub);
 
     // 格式化到期日期（使用所选时区）
     const expiryDateObj = new Date(sub.expiryDate);
@@ -5155,8 +4624,7 @@ function formatNotificationContent(subscriptions, config) {
     let lunarExpiryText = '';
     if (showLunar) {
       const lunarExpiry = lunarCalendar.solar2lunar(expiryDateObj.getFullYear(), expiryDateObj.getMonth() + 1, expiryDateObj.getDate());
-      lunarExpiryText = lunarExpiry ? `
-农历日期: ${lunarExpiry.fullStr}` : '';
+      lunarExpiryText = lunarExpiry ? `\n农历日期: ${lunarExpiry.fullStr}` : '';
     }
 
     // 状态和到期时间
@@ -5173,13 +4641,6 @@ function formatNotificationContent(subscriptions, config) {
       statusText = `将在 ${sub.daysRemaining} 天后到期`;
     }
 
-    const reminderSuffix = reminderSetting.value === 0
-      ? '（仅到期时提醒）'
-      : (reminderSetting.unit === 'hour' ? '（小时级提醒）' : '');
-    const reminderText = reminderSetting.unit === 'hour'
-      ? `提醒策略: 提前 ${reminderSetting.value} 小时${reminderSuffix}`
-      : `提醒策略: 提前 ${reminderSetting.value} 天${reminderSuffix}`;
-
     // 获取日历类型和自动续期状态
     const calendarType = sub.useLunar ? '农历' : '公历';
     const autoRenewText = sub.autoRenew ? '是' : '否';
@@ -5187,11 +4648,9 @@ function formatNotificationContent(subscriptions, config) {
     // 构建格式化的通知内容
     const subscriptionContent = `${statusEmoji} **${sub.name}**
 类型: ${typeText} ${periodText}
-分类: ${categoryText}
 日历类型: ${calendarType}
 到期日期: ${formattedExpiryDate}${lunarExpiryText}
 自动续期: ${autoRenewText}
-${reminderText}
 到期状态: ${statusText}`;
 
     // 添加备注
@@ -5209,8 +4668,7 @@ ${reminderText}
   return content;
 }
 
-async function sendNotificationToAllChannels(title, commonContent, config, logPrefix = '[定时任务]', options = {}) {
-  const metadata = options.metadata || {};
+async function sendNotificationToAllChannels(title, commonContent, config, logPrefix = '[定时任务]') {
     if (!config.ENABLED_NOTIFIERS || config.ENABLED_NOTIFIERS.length === 0) {
         console.log(`${logPrefix} 未启用任何通知渠道。`);
         return;
@@ -5228,8 +4686,8 @@ async function sendNotificationToAllChannels(title, commonContent, config, logPr
     }
     if (config.ENABLED_NOTIFIERS.includes('webhook')) {
         const webhookContent = commonContent.replace(/(\**|\*|##|#|`)/g, '');
-        const success = await sendWebhookNotification(title, webhookContent, config, metadata);
-        console.log(`${logPrefix} 发送Webhook通知 ${success ? '成功' : '失败'}`);
+        const success = await sendWebhookNotification(title, webhookContent, config);
+        console.log(`${logPrefix} 发送企业微信应用通知 ${success ? '成功' : '失败'}`);
     }
     if (config.ENABLED_NOTIFIERS.includes('wechatbot')) {
         const wechatbotContent = commonContent.replace(/(\**|\*|##|#|`)/g, '');
@@ -5245,11 +4703,6 @@ async function sendNotificationToAllChannels(title, commonContent, config, logPr
         const emailContent = commonContent.replace(/(\**|\*|##|#|`)/g, '');
         const success = await sendEmailNotification(title, emailContent, config);
         console.log(`${logPrefix} 发送邮件通知 ${success ? '成功' : '失败'}`);
-    }
-    if (config.ENABLED_NOTIFIERS.includes('bark')) {
-        const barkContent = commonContent.replace(/(\**|\*|##|#|`)/g, '');
-        const success = await sendBarkNotification(title, barkContent, config);
-        console.log(`${logPrefix} 发送Bark通知 ${success ? '成功' : '失败'}`);
     }
 }
 
@@ -5307,47 +4760,6 @@ async function sendNotifyXNotification(title, content, description, config) {
     return result.status === 'queued';
   } catch (error) {
     console.error('[NotifyX] 发送通知失败:', error);
-    return false;
-  }
-}
-
-async function sendBarkNotification(title, content, config) {
-  try {
-    if (!config.BARK_DEVICE_KEY) {
-      console.error('[Bark] 通知未配置，缺少设备Key');
-      return false;
-    }
-
-    console.log('[Bark] 开始发送通知到设备: ' + config.BARK_DEVICE_KEY);
-
-    const serverUrl = config.BARK_SERVER || 'https://api.day.app';
-    const url = serverUrl + '/push';
-    const payload = {
-      title: title,
-      body: content,
-      device_key: config.BARK_DEVICE_KEY
-    };
-
-    // 如果配置了保存推送，则添加isArchive参数
-    if (config.BARK_IS_ARCHIVE === 'true') {
-      payload.isArchive = 1;
-    }
-
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8'
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const result = await response.json();
-    console.log('[Bark] 发送结果:', result);
-    
-    // Bark API返回code为200表示成功
-    return result.code === 200;
-  } catch (error) {
-    console.error('[Bark] 发送通知失败:', error);
     return false;
   }
 }
@@ -5451,18 +4863,6 @@ async function checkExpiringSubscriptions(env) {
     const currentTime = getCurrentTimeInTimezone(timezone);
     console.log('[定时任务] 开始检查即将到期的订阅 UTC: ' + new Date().toISOString() + ', ' + timezone + ': ' + currentTime.toLocaleString('zh-CN', {timeZone: timezone}));
 
-    const currentMidnight = getTimezoneMidnightTimestamp(currentTime, timezone); // 统一计算当天的零点时间，避免多次格式化
-
-    const rawNotificationHours = Array.isArray(config.NOTIFICATION_HOURS) ? config.NOTIFICATION_HOURS : [];
-    const normalizedNotificationHours = rawNotificationHours
-      .map(value => String(value).trim())
-      .filter(value => value.length > 0)
-      .map(value => value === '*' ? '*' : value.toUpperCase() === 'ALL' ? 'ALL' : value.padStart(2, '0'));
-    const allowAllHours = normalizedNotificationHours.includes('*') || normalizedNotificationHours.includes('ALL');
-    const hourFormatter = new Intl.DateTimeFormat('en-US', { timeZone: timezone, hour12: false, hour: '2-digit' });
-    const currentHour = hourFormatter.format(currentTime);
-    const shouldNotifyThisHour = allowAllHours || normalizedNotificationHours.length === 0 || normalizedNotificationHours.includes(currentHour);
-
     const subscriptions = await getAllSubscriptions(env);
     console.log('[定时任务] 共找到 ' + subscriptions.length + ' 个订阅');
     const expiringSubscriptions = [];
@@ -5475,9 +4875,6 @@ for (const subscription of subscriptions) {
     continue;
   }
 
-  const reminderSetting = resolveReminderSetting(subscription);
-  let diffMs = 0;
-  let diffHours = 0;
   let daysDiff;
   if (subscription.useLunar) {
     const expiryDate = new Date(subscription.expiryDate);
@@ -5486,16 +4883,31 @@ for (const subscription of subscriptions) {
       expiryDate.getMonth() + 1,
       expiryDate.getDate()
     );
+    // 使用与前端一致的计算逻辑：基于时区日期的午夜时间
     const solar = lunarBiz.lunar2solar(lunar);
     const lunarDate = new Date(solar.year, solar.month - 1, solar.day);
-    const lunarMidnight = getTimezoneMidnightTimestamp(lunarDate, timezone);
     
-    daysDiff = Math.round((lunarMidnight - currentMidnight) / MS_PER_DAY);
+    const currentDtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const currentParts = currentDtf.formatToParts(currentTime);
+    const getCurrent = type => Number(currentParts.find(x => x.type === type).value);
+    const currentDateInTimezone = Date.UTC(getCurrent('year'), getCurrent('month') - 1, getCurrent('day'), 0, 0, 0);
+    
+    const lunarDtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const lunarParts = lunarDtf.formatToParts(lunarDate);
+    const getLunar = type => Number(lunarParts.find(x => x.type === type).value);
+    const lunarDateInTimezone = Date.UTC(getLunar('year'), getLunar('month') - 1, getLunar('day'), 0, 0, 0);
+    
+    daysDiff = Math.round((lunarDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
 
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(lunarMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
-
-    diffMs = expiryDate.getTime() - currentTime.getTime();
-    diffHours = diffMs / MS_PER_HOUR;
+    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(lunarDateInTimezone).toISOString() + ', 剩余天数: ' + daysDiff);
 
     if (daysDiff < 0 && subscription.periodValue && subscription.periodUnit && subscription.autoRenew !== false) {
       let nextLunar = lunar;
@@ -5503,39 +4915,63 @@ for (const subscription of subscriptions) {
         nextLunar = lunarBiz.addLunarPeriod(nextLunar, subscription.periodValue, subscription.periodUnit);
         const solar = lunarBiz.lunar2solar(nextLunar);
         var newExpiryDate = new Date(solar.year, solar.month - 1, solar.day);
-        const newLunarMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
-        daysDiff = Math.round((newLunarMidnight - currentMidnight) / MS_PER_DAY);
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString() + ', 农历转换后午夜时间: ' + new Date(newLunarMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
+        // 使用与前端一致的计算逻辑：基于时区日期的午夜时间
+        const newLunarDtf = new Intl.DateTimeFormat('en-US', {
+          timeZone: timezone,
+          hour12: false,
+          year: 'numeric', month: '2-digit', day: '2-digit'
+        });
+        const newLunarParts = newLunarDtf.formatToParts(newExpiryDate);
+        const getNewLunar = type => Number(newLunarParts.find(x => x.type === type).value);
+        const newLunarDateInTimezone = Date.UTC(getNewLunar('year'), getNewLunar('month') - 1, getNewLunar('day'), 0, 0, 0);
+        daysDiff = Math.round((newLunarDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
+        console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString() + ', 农历转换后: ' + new Date(newLunarDateInTimezone).toISOString() + ', 剩余天数: ' + daysDiff);
       } while (daysDiff < 0);
-
-      diffMs = newExpiryDate.getTime() - currentTime.getTime();
-      diffHours = diffMs / MS_PER_HOUR;
 
       const updatedSubscription = { ...subscription, expiryDate: newExpiryDate.toISOString() };
       updatedSubscriptions.push(updatedSubscription);
       hasUpdates = true;
 
-      const shouldRemindAfterRenewal = shouldTriggerReminder(reminderSetting, daysDiff, diffHours);
+      let reminderDays = subscription.reminderDays !== undefined ? subscription.reminderDays : 7;
+      let shouldRemindAfterRenewal = false;
+      if (reminderDays === 0) {
+        shouldRemindAfterRenewal = daysDiff === 0;
+      } else {
+        shouldRemindAfterRenewal = daysDiff >= 0 && daysDiff <= reminderDays;
+      }
       if (shouldRemindAfterRenewal) {
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
+        console.log('[定时任务] 订阅 "' + subscription.name + '" 续订后仍在提醒范围内，将发送通知');
         expiringSubscriptions.push({
           ...updatedSubscription,
-          daysRemaining: daysDiff,
-          hoursRemaining: Math.round(diffHours)
+          daysRemaining: daysDiff
         });
       }
       continue;
     }
   } else {
     const expiryDate = new Date(subscription.expiryDate);
-    const expiryMidnight = getTimezoneMidnightTimestamp(expiryDate, timezone);
+    // 使用与前端一致的计算逻辑：基于时区日期的午夜时间
+    const currentDtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const currentParts = currentDtf.formatToParts(currentTime);
+    const getCurrent = type => Number(currentParts.find(x => x.type === type).value);
+    const currentDateInTimezone = Date.UTC(getCurrent('year'), getCurrent('month') - 1, getCurrent('day'), 0, 0, 0);
+    
+    const expiryDtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit'
+    });
+    const expiryParts = expiryDtf.formatToParts(expiryDate);
+    const getExpiry = type => Number(expiryParts.find(x => x.type === type).value);
+    const expiryDateInTimezone = Date.UTC(getExpiry('year'), getExpiry('month') - 1, getExpiry('day'), 0, 0, 0);
+    
+    daysDiff = Math.round((expiryDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
 
-    daysDiff = Math.round((expiryMidnight - currentMidnight) / MS_PER_DAY);
-
-    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 时区午夜时间: ' + new Date(expiryMidnight).toISOString() + ', 剩余天数: ' + daysDiff);
-
-    diffMs = expiryDate.getTime() - currentTime.getTime();
-    diffHours = diffMs / MS_PER_HOUR;
+    console.log('[定时任务] 订阅 "' + subscription.name + '" 到期日期: ' + expiryDate.toISOString() + ', 时区午夜时间: ' + new Date(expiryDateInTimezone).toISOString() + ', 剩余天数: ' + daysDiff);
 
     if (daysDiff < 0 && subscription.periodValue && subscription.periodUnit && subscription.autoRenew !== false) {
       const newExpiryDate = new Date(expiryDate);
@@ -5548,9 +4984,17 @@ for (const subscription of subscriptions) {
         newExpiryDate.setFullYear(expiryDate.getFullYear() + subscription.periodValue);
       }
 
-      let newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
-      while (newExpiryMidnight < currentMidnight) {
-        console.log('[定时任务] 新计算的到期日期 ' + newExpiryDate.toISOString() + ' (时区转换后午夜: ' + new Date(newExpiryMidnight).toISOString() + ') 仍然过期，继续计算下一个周期');
+      // 将新计算的到期日期转换为指定时区进行比较（使用午夜时间）
+      const newExpiryDtfForCompare = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit'
+      });
+      let newExpiryPartsForCompare = newExpiryDtfForCompare.formatToParts(newExpiryDate);
+      let getNewExpiryForCompare = type => Number(newExpiryPartsForCompare.find(x => x.type === type).value);
+      let newExpiryDateInTimezoneForCompare = Date.UTC(getNewExpiryForCompare('year'), getNewExpiryForCompare('month') - 1, getNewExpiryForCompare('day'), 0, 0, 0);
+      while (newExpiryDateInTimezoneForCompare < currentDateInTimezone) {
+        console.log('[定时任务] 新计算的到期日期 ' + newExpiryDate.toISOString() + ' (时区转换后: ' + new Date(newExpiryDateInTimezoneForCompare).toISOString() + ') 仍然过期，继续计算下一个周期');
         if (subscription.periodUnit === 'day') {
           newExpiryDate.setDate(newExpiryDate.getDate() + subscription.periodValue);
         } else if (subscription.periodUnit === 'month') {
@@ -5558,49 +5002,65 @@ for (const subscription of subscriptions) {
         } else if (subscription.periodUnit === 'year') {
           newExpiryDate.setFullYear(newExpiryDate.getFullYear() + subscription.periodValue);
         }
-        newExpiryMidnight = getTimezoneMidnightTimestamp(newExpiryDate, timezone);
+        // 更新时区转换后的时间用于下次比较（使用午夜时间）
+        newExpiryPartsForCompare = newExpiryDtfForCompare.formatToParts(newExpiryDate);
+        getNewExpiryForCompare = type => Number(newExpiryPartsForCompare.find(x => x.type === type).value);
+        newExpiryDateInTimezoneForCompare = Date.UTC(getNewExpiryForCompare('year'), getNewExpiryForCompare('month') - 1, getNewExpiryForCompare('day'), 0, 0, 0);
       }
 
-      console.log('[定时任务] 订阅 "' + subscription.name + '" 更新到期日期: ' + newExpiryDate.toISOString());
-
-      diffMs = newExpiryDate.getTime() - currentTime.getTime();
-      diffHours = diffMs / MS_PER_HOUR;
+      console.log('[定时任务] 订阅 "' + subscription.name + '" 续订到期日期: ' + newExpiryDate.toISOString());
 
       const updatedSubscription = { ...subscription, expiryDate: newExpiryDate.toISOString() };
       updatedSubscriptions.push(updatedSubscription);
       hasUpdates = true;
 
-      const newDaysDiff = Math.round((newExpiryMidnight - currentMidnight) / MS_PER_DAY);
-      const shouldRemindAfterRenewal = shouldTriggerReminder(reminderSetting, newDaysDiff, diffHours);
+      // 将新的到期日期转换为指定时区的时间，然后计算天数差（使用午夜时间）
+      const newExpiryDtf = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone,
+        hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit'
+      });
+      const newExpiryParts = newExpiryDtf.formatToParts(newExpiryDate);
+      const getNewExpiry = type => Number(newExpiryParts.find(x => x.type === type).value);
+      const newExpiryDateInTimezone = Date.UTC(getNewExpiry('year'), getNewExpiry('month') - 1, getNewExpiry('day'), 0, 0, 0);
+      const newDaysDiff = Math.round((newExpiryDateInTimezone - currentDateInTimezone) / (1000 * 60 * 60 * 24));
+      let reminderDays = subscription.reminderDays !== undefined ? subscription.reminderDays : 7;
+      let shouldRemindAfterRenewal = false;
+      if (reminderDays === 0) {
+        shouldRemindAfterRenewal = newDaysDiff === 0;
+      } else {
+        shouldRemindAfterRenewal = newDaysDiff >= 0 && newDaysDiff <= reminderDays;
+      }
       if (shouldRemindAfterRenewal) {
-        console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
+        console.log('[定时任务] 订阅 "' + subscription.name + '" 续订后仍在提醒范围内，将发送通知');
         expiringSubscriptions.push({
           ...updatedSubscription,
-          daysRemaining: newDaysDiff,
-          hoursRemaining: Math.round(diffHours)
+          daysRemaining: newDaysDiff
         });
       }
       continue;
     }
   }
 
-  diffMs = new Date(subscription.expiryDate).getTime() - currentTime.getTime();
-  diffHours = diffMs / MS_PER_HOUR;
-  const shouldRemind = shouldTriggerReminder(reminderSetting, daysDiff, diffHours);
+  const reminderDays = subscription.reminderDays !== undefined ? subscription.reminderDays : 7;
+  let shouldRemind = false;
+  if (reminderDays === 0) {
+    shouldRemind = daysDiff === 0;
+  } else {
+    shouldRemind = daysDiff >= 0 && daysDiff <= reminderDays;
+  }
 
   if (daysDiff < 0 && subscription.autoRenew === false) {
     console.log('[定时任务] 订阅 "' + subscription.name + '" 已过期且未启用自动续订，将发送过期通知');
     expiringSubscriptions.push({
       ...subscription,
-      daysRemaining: daysDiff,
-      hoursRemaining: Math.round(diffHours)
+      daysRemaining: daysDiff
     });
   } else if (shouldRemind) {
     console.log('[定时任务] 订阅 "' + subscription.name + '" 在提醒范围内，将发送通知');
     expiringSubscriptions.push({
       ...subscription,
-      daysRemaining: daysDiff,
-      hoursRemaining: Math.round(diffHours)
+      daysRemaining: daysDiff
     });
   }
 }
@@ -5614,22 +5074,14 @@ for (const subscription of subscriptions) {
     }
 
     if (expiringSubscriptions.length > 0) {
-      if (!shouldNotifyThisHour) {
-        console.log('[定时任务] 当前小时 ' + currentHour + ' 未配置为推送时间，跳过发送通知');
-        expiringSubscriptions.length = 0;
-      } else {
-        // 按到期时间排序
-        expiringSubscriptions.sort((a, b) => a.daysRemaining - b.daysRemaining);
+      // 按到期时间排序
+      expiringSubscriptions.sort((a, b) => a.daysRemaining - b.daysRemaining);
 
-        // 使用优化的格式化函数
-        const commonContent = formatNotificationContent(expiringSubscriptions, config);
-        const metadataTags = extractTagsFromSubscriptions(expiringSubscriptions);
+      // 使用优化的格式化函数
+      const commonContent = formatNotificationContent(expiringSubscriptions, config);
 
-        const title = '订阅到期提醒';
-        await sendNotificationToAllChannels(title, commonContent, config, '[定时任务]', {
-          metadata: { tags: metadataTags }
-        });
-      }
+      const title = '订阅到期提醒';
+      await sendNotificationToAllChannels(title, commonContent, config, '[定时任务]');
     }
   } catch (error) {
     console.error('[定时任务] 检查即将到期的订阅失败:', error);
@@ -5694,80 +5146,22 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // --- 优化开始：动态确定 Base Path 用于调试和路由逻辑 ---
+    // 从路径中提取子路径，例如 /notice/admin -> /notice
+    let basePath = url.pathname.replace('/admin', '').replace('/config', '').replace('/api', '').replace('/debug', '').replace(/\/$/, '');
+    if (basePath.length > 1 && basePath.includes('/')) {
+        // 如果路径是 /notice/something，只取 /notice
+        basePath = '/' + url.pathname.split('/')[1];
+    } else if (basePath.length > 1) {
+        basePath = '/' + basePath.substring(1);
+    } else {
+        basePath = '';
+    }
+    // --------------------------------------------------
+
+
     // 添加调试页面
-    if (url.pathname === '/debug') {
+    if (url.pathname === basePath + '/debug' || url.pathname === '/debug') {
       try {
         const config = await getConfig(env);
-        const debugInfo = {
-          timestamp: new Date().toISOString(), // 使用UTC时间戳
-          pathname: url.pathname,
-          kvBinding: !!env.SUBSCRIPTIONS_KV,
-          configExists: !!config,
-          adminUsername: config.ADMIN_USERNAME,
-          hasJwtSecret: !!config.JWT_SECRET,
-          jwtSecretLength: config.JWT_SECRET ? config.JWT_SECRET.length : 0
-        };
-
-        return new Response(`
-<!DOCTYPE html>
-<html>
-<head>
-  <title>调试信息</title>
-  <style>
-    body { font-family: monospace; padding: 20px; background: #f5f5f5; }
-    .info { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
-    .success { color: green; }
-    .error { color: red; }
-  </style>
-</head>
-<body>
-  <h1>系统调试信息</h1>
-  <div class="info">
-    <h3>基本信息</h3>
-    <p>时间: ${debugInfo.timestamp}</p>
-    <p>路径: ${debugInfo.pathname}</p>
-    <p class="${debugInfo.kvBinding ? 'success' : 'error'}">KV绑定: ${debugInfo.kvBinding ? '✓' : '✗'}</p>
-  </div>
-
-  <div class="info">
-    <h3>配置信息</h3>
-    <p class="${debugInfo.configExists ? 'success' : 'error'}">配置存在: ${debugInfo.configExists ? '✓' : '✗'}</p>
-    <p>管理员用户名: ${debugInfo.adminUsername}</p>
-    <p class="${debugInfo.hasJwtSecret ? 'success' : 'error'}">JWT密钥: ${debugInfo.hasJwtSecret ? '✓' : '✗'} (长度: ${debugInfo.jwtSecretLength})</p>
-  </div>
-
-  <div class="info">
-    <h3>解决方案</h3>
-    <p>1. 确保KV命名空间已正确绑定为 SUBSCRIPTIONS_KV</p>
-    <p>2. 尝试访问 <a href="/">/</a> 进行登录</p>
-    <p>3. 如果仍有问题，请检查Cloudflare Workers日志</p>
-  </div>
-</body>
-</html>`, {
-          headers: { 'Content-Type': 'text/html; charset=utf-8' }
-        });
-      } catch (error) {
-        return new Response(`调试页面错误: ${error.message}`, {
-          status: 500,
-          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
-        });
-      }
-    }
-
-    if (url.pathname.startsWith('/api')) {
-      return api.handleRequest(request, env, ctx);
-    } else if (url.pathname.startsWith('/admin')) {
-      return admin.handleRequest(request, env, ctx);
-    } else {
-      return handleRequest(request, env, ctx);
-    }
-  },
-
-  async scheduled(event, env, ctx) {
-    const config = await getConfig(env);
-    const timezone = config?.TIMEZONE || 'UTC';
-    const currentTime = getCurrentTimeInTimezone(timezone);
-    console.log('[Workers] 定时任务触发 UTC:', new Date().toISOString(), timezone + ':', currentTime.toLocaleString('zh-CN', {timeZone: timezone}));
-    await checkExpiringSubscriptions(env);
-  }
-};
+        const debugInfo
