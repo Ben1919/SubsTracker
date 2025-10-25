@@ -900,6 +900,7 @@ const adminPage = `
     </div>
   </div>
 
+  <!-- 添加/编辑订阅的模态框 -->
   <div id="subscriptionModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 modal-container hidden flex items-center justify-center z-50">
     <div class="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-screen overflow-y-auto">
       <div class="bg-gray-50 px-6 py-4 border-b border-gray-200 rounded-t-lg">
@@ -966,6 +967,7 @@ const adminPage = `
                     </button>
                   </div>
                   
+                  <!-- 月份选择器 -->
                   <div id="startDateMonthPicker" class="hidden mb-4">
                     <div class="flex justify-between items-center mb-3">
                       <span class="font-medium text-gray-900">选择月份</span>
@@ -989,6 +991,7 @@ const adminPage = `
                     </div>
                   </div>
                   
+                  <!-- 年份选择器 -->
                   <div id="startDateYearPicker" class="hidden mb-4">
                     <div class="flex justify-between items-center mb-3">
                       <span class="font-medium text-gray-900">选择年份</span>
@@ -1006,7 +1009,8 @@ const adminPage = `
                       </button>
                     </div>
                     <div id="startDateYearGrid" class="grid grid-cols-3 gap-2">
-                      </div>
+                      <!-- 年份按钮将通过JavaScript动态生成 -->
+                    </div>
                   </div>
                   
                   <div class="grid grid-cols-7 gap-2 mb-3">
@@ -1020,6 +1024,7 @@ const adminPage = `
                   </div>
                   <div id="startDateCalendar" class="grid grid-cols-7 gap-2"></div>
                   
+                  <!-- 回到今天按钮 -->
                   <div class="mt-4 pt-3 border-t border-gray-200">
                     <button type="button" id="startDateGoToToday" class="w-full px-3 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-md">
                       <i class="fas fa-calendar-day mr-2"></i>回到今天
@@ -1075,6 +1080,7 @@ const adminPage = `
                   </button>
                 </div>
                 
+                <!-- 月份选择器 -->
                 <div id="expiryDateMonthPicker" class="hidden mb-4">
                   <div class="flex justify-between items-center mb-3">
                     <span class="font-medium text-gray-900">选择月份</span>
@@ -1098,6 +1104,7 @@ const adminPage = `
                   </div>
                 </div>
                 
+                <!-- 年份选择器 -->
                 <div id="expiryDateYearPicker" class="hidden mb-4">
                   <div class="flex justify-between items-center mb-3">
                     <span class="font-medium text-gray-900">选择年份</span>
@@ -1115,7 +1122,8 @@ const adminPage = `
                     </button>
                   </div>
                   <div id="expiryDateYearGrid" class="grid grid-cols-3 gap-2">
-                    </div>
+                    <!-- 年份按钮将通过JavaScript动态生成 -->
+                  </div>
                 </div>
                 
                 <div class="grid grid-cols-7 gap-2 mb-3">
@@ -1129,6 +1137,7 @@ const adminPage = `
                 </div>
                 <div id="expiryDateCalendar" class="grid grid-cols-7 gap-2"></div>
                 
+                <!-- 回到今天按钮 -->
                 <div class="mt-4 pt-3 border-t border-gray-200">
                   <button type="button" id="expiryDateGoToToday" class="w-full px-3 py-2 text-sm text-indigo-600 hover:bg-indigo-50 rounded-md">
                     <i class="fas fa-calendar-day mr-2"></i>回到今天
@@ -5161,7 +5170,79 @@ export default {
 
 
     // 添加调试页面
-    if (url.pathname === basePath + '/debug' || url.pathname === '/debug') {
+    if (url.pathname === '/debug') {
       try {
         const config = await getConfig(env);
-        const debugInfo
+        const debugInfo = {
+          timestamp: new Date().toISOString(), // 使用UTC时间戳
+          pathname: url.pathname,
+          kvBinding: !!env.SUBSCRIPTIONS_KV,
+          configExists: !!config,
+          adminUsername: config.ADMIN_USERNAME,
+          hasJwtSecret: !!config.JWT_SECRET,
+          jwtSecretLength: config.JWT_SECRET ? config.JWT_SECRET.length : 0
+        };
+
+        return new Response(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>调试信息</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #f5f5f5; }
+    .info { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+    .success { color: green; }
+    .error { color: red; }
+  </style>
+</head>
+<body>
+  <h1>系统调试信息</h1>
+  <div class="info">
+    <h3>基本信息</h3>
+    <p>时间: ${debugInfo.timestamp}</p>
+    <p>路径: ${debugInfo.pathname}</p>
+    <p class="${debugInfo.kvBinding ? 'success' : 'error'}">KV绑定: ${debugInfo.kvBinding ? '✓' : '✗'}</p>
+  </div>
+
+  <div class="info">
+    <h3>配置信息</h3>
+    <p class="${debugInfo.configExists ? 'success' : 'error'}">配置存在: ${debugInfo.configExists ? '✓' : '✗'}</p>
+    <p>管理员用户名: ${debugInfo.adminUsername}</p>
+    <p class="${debugInfo.hasJwtSecret ? 'success' : 'error'}">JWT密钥: ${debugInfo.hasJwtSecret ? '✓' : '✗'} (长度: ${debugInfo.jwtSecretLength})</p>
+  </div>
+
+  <div class="info">
+    <h3>解决方案</h3>
+    <p>1. 确保KV命名空间已正确绑定为 SUBSCRIPTIONS_KV</p>
+    <p>2. 尝试访问 <a href="/">/</a> 进行登录</p>
+    <p>3. 如果仍有问题，请检查Cloudflare Workers日志</p>
+  </div>
+</body>
+</html>`, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8' }
+        });
+      } catch (error) {
+        return new Response(`调试页面错误: ${error.message}`, {
+          status: 500,
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+        });
+      }
+    }
+
+    if (url.pathname.startsWith('/api')) {
+      return api.handleRequest(request, env, ctx);
+    } else if (url.pathname.startsWith('/admin')) {
+      return admin.handleRequest(request, env, ctx);
+    } else {
+      return handleRequest(request, env, ctx);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    const config = await getConfig(env);
+    const timezone = config?.TIMEZONE || 'UTC';
+    const currentTime = getCurrentTimeInTimezone(timezone);
+    console.log('[Workers] 定时任务触发 UTC:', new Date().toISOString(), timezone + ':', currentTime.toLocaleString('zh-CN', {timeZone: timezone}));
+    await checkExpiringSubscriptions(env);
+  }
+};
